@@ -140,9 +140,20 @@ function changedByYouFix(delivery: ToolDelivery): string {
     : '';
 }
 
-/** Whether a tool's delivery has a problem other than copies the member changed. */
+/**
+ * The label for an agent copy that still carries the model the last pull
+ * resolved, since changed by the member's aliases file, a model switch or the
+ * team's aliases (#830). A plain pull redeploys it.
+ */
+const MODEL_CHANGED = 'model changed since the last pull';
+
+/**
+ * Whether a tool's delivery has a problem other than copies the member
+ * changed or whose model changed since the last pull, which the next pull
+ * redeploys (spec story 52 of #830).
+ */
 function hasDeliveryProblem(delivery: ToolDelivery): boolean {
-  return [...delivery.problems.keys()].some((label) => label !== CHANGED_BY_YOU);
+  return [...delivery.problems.keys()].some((label) => label !== CHANGED_BY_YOU && label !== MODEL_CHANGED);
 }
 
 /**
@@ -159,7 +170,7 @@ async function differingCopyLabel(
 }
 
 /** `a, b, c and 4 more` — a fix a human reads, not a wall of paths. */
-function nameList(names: string[]): string {
+export function nameList(names: string[]): string {
   if (names.length <= MAX_NAMED_IN_FIX) return names.join(', ');
   const shown = names.slice(0, MAX_NAMED_IN_FIX).join(', ');
   return `${shown} and ${names.length - MAX_NAMED_IN_FIX} more`;
@@ -393,32 +404,58 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
 
   // An agent whose spec reaches no tool at all is not a per-tool failure: the
   // file is in the team repo and nothing renders it anywhere.
-  const agentLabels = ['not delivered', 'delivered from an older spec', CHANGED_BY_YOU] as const;
-  const { byTool, unreceived: unreachable } = await walkDelivery(
+  const agentLabels = ['not delivered', 'delivered from an older spec', MODEL_CHANGED, CHANGED_BY_YOU] as const;
+  // What the last pull wrote for each agent, its model as recorded then (#830).
+  const recordedTargets = new Map<string, Promise<DeliveryTarget[]>>();
+  const recordedContent = async (item: ResourceItem, tool: string): Promise<string | undefined> => {
+    let targets = recordedTargets.get(item.name);
+    if (!targets) {
+      targets = handler.recordedDeliveryTargets(teamConfig, localConfig, item);
+      recordedTargets.set(item.name, targets);
+    }
+    return (await targets).find((target) => target.tool === tool)?.content;
+  };
+  const { byTool, unreceived } = await walkDelivery(
     handler,
     ctx,
     items,
     // `pullItem` writes `content` verbatim, so anything else at that path is a
     // render of an older spec — a copy that landed and is still wrong, the
-    // same class as a rule whose delivered copy no longer matches its render.
+    // same class as a rule whose delivered copy no longer matches its render —
+    // or of the model the last pull resolved, which has changed since.
     async (target, item) => {
       // readFileSafe answers both questions at once: a directory or a dangling
       // link on the name reads as null, the same as nothing being there.
       const delivered = await readFileSafe(target.dest);
       if (delivered === null) return agentLabels[0];
       if (target.content === undefined || delivered === target.content) return null;
+      if (delivered === await recordedContent(item, target.tool)) return MODEL_CHANGED;
       return differingCopyLabel(item, target, agentLabels[1], localConfig);
     },
   );
+  // An agent whose model cannot be resolved is held, not unreachable: the
+  // model aliases check names the reason.
+  const { heldAgentNames } = await import('./doctor-agent-models.js');
+  const held = await heldAgentNames(ctx);
+  const unreachable = unreceived.filter((name) => !held.has(name));
 
-  const checks: Check[] = [...byTool].map(([tool, delivery]) => ({
-    name: `Agents delivered to ${tool}`,
-    source: 'local',
-    check: async () => !hasDeliveryProblem(delivery),
-    fix: `In ${delivery.dir}, ${describeProblems(delivery.problems, agentLabels)}. `
-      + 'Run `teamai pull --force`: a plain pull skips a scope whose team repo has not changed, '
-      + `so it cannot restore this.${changedByYouFix(delivery)}`,
-  }));
+  const checks: Check[] = [...byTool].map(([tool, delivery]) => {
+    const modelChanged = delivery.problems.has(MODEL_CHANGED);
+    const restoredByForce = [...delivery.problems.keys()].some((label) => label !== MODEL_CHANGED && label !== CHANGED_BY_YOU);
+    return {
+      name: `Agents delivered to ${tool}`,
+      source: 'local',
+      check: async () => !hasDeliveryProblem(delivery),
+      fix: [
+        `In ${delivery.dir}, ${describeProblems(delivery.problems, agentLabels)}.`,
+        ...(modelChanged ? ['A plain `teamai pull` redeploys an agent whose model changed.'] : []),
+        ...(restoredByForce
+          ? [`${modelChanged ? 'For the rest, run' : 'Run'} \`teamai pull --force\`: a plain pull skips a scope whose team repo `
+            + 'has not changed, so it cannot restore this.']
+          : []),
+      ].join(' ') + changedByYouFix(delivery),
+    };
+  });
 
   // Only worth reporting once a tool is there to receive agents: with none
   // installed, "reaches no tool" is the machine, not the team repo. The gate is

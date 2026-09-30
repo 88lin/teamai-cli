@@ -282,7 +282,7 @@ export async function activeEntryNamespaces(
  * `checkout` on every filesystem, not only the case-insensitive ones. An exact
  * match wins on one that has both; with neither, the name itself.
  */
-function namespaceDir(dirs: readonly string[], namespace: string): string {
+export function namespaceDir(dirs: readonly string[], namespace: string): string {
   return dirs.includes(namespace)
     ? namespace
     : dirs.find((dir) => caseFoldKey(dir) === caseFoldKey(namespace)) ?? namespace;

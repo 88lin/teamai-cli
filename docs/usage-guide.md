@@ -651,7 +651,7 @@ teamai pull --dry-run    # Dry run, no actual changes
 
 A manual `teamai pull` ends by running the `teamai doctor` checks and printing each one that failed, with its fix — including whether the skills it just reported syncing are readable on disk for every enabled tool. It prints nothing when they all pass, and the exit code is unchanged. The SessionStart hook path and `--dry-run` run no checks at all, so session startup stays as fast as before. Provider checks (`gh`/`gf` authentication) are left to `teamai doctor`: the pull just used the provider.
 
-**Pull keeps a skill, rule or agent you changed.** For each checkout, pull records what it wrote at each skill, rule and agent path. On a full sync, a copy that no longer matches that record is kept, and pull names it, while the copies of other tools still update. A skill counts as one copy: a change to any of its team files keeps the whole skill, and files only you added do not count. If the team version has not changed, pull prints ``Kept <path>: you changed it since teamai delivered it. Share it with `teamai push`, or delete it and run `teamai pull --force` to get the team version back.`` If it has, pull warns and asks you to merge the team change into your copy before you push it, and `teamai push` warns about that copy too, since the SessionStart pull runs silently. `--force` keeps these copies too, and `--dry-run` prints `Would keep <path>` for each. When the team removes an item, a copy you changed stays, and pull names it. There is no record before your first full pull with this version, so that pull overwrites as earlier versions did, and your changes are protected from then on. The same goes for a new worktree's first pull, and for a copy teamai never delivered to that path. `teamai remove` and installs from the local agent still rewrite the team rules without this check. An older CLI that saves state drops the record.
+**Pull keeps a skill, rule or agent you changed.** For each checkout, pull records what it wrote at each skill, rule and agent path. On a full sync, a copy that no longer matches that record is kept, and pull names it, while the copies of other tools still update. A skill counts as one copy: a change to any of its team files keeps the whole skill, and files only you added do not count. If the team version has not changed, pull prints ``Kept <path>: you changed it since teamai delivered it. Share it with `teamai push`, or delete it and run `teamai pull --force` to get the team version back.`` If it has, whether the team changed it or your [local model alias override](#local-override) did, pull warns and asks you to merge that change into your copy before you push it, and `teamai push` warns about that copy too, since the SessionStart pull runs silently. `--force` keeps these copies too, and `--dry-run` prints `Would keep <path>` for each. When the team removes an item, a copy you changed stays, and pull names it. There is no record before your first full pull with this version, so that pull overwrites as earlier versions did, and your changes are protected from then on. The same goes for a new worktree's first pull, and for a copy teamai never delivered to that path. `teamai remove` and installs from the local agent still rewrite the team rules without this check. An older CLI that saves state drops the record.
 
 > Project scope is isolated by default. When the current working directory contains a project-scope `.teamai/config.yaml`, `pull` processes that project and skips user scope unless the local config has `inheritUserScope: true`; in that case it first refreshes the safe user-resource channel. Without a project config in the current directory, `pull` processes user scope. User `env`, MCP definitions, sources, reporting, and writes remain isolated in project mode. Hooks are the one exception: a project scope's hooks are injected into your **HOME** tool settings (`~/.claude/settings.json`, …), not `<projectRoot>`, because the built-in hooks gate on the `cwd` handed to `hook-dispatch` and `~/.claude` always exists so the "installed tool" gate passes (see the Hooks section). In a directory with no teamai config (no project config and no user scope), the team hooks do nothing: no reminders, and no session or skill usage is recorded; only machine-level work runs (the CLI update check, the session-start pull, the local agent, and package hints a pull stashed). For the team hooks and skill usage, a project config that exists but cannot be read counts as none, never as the user scope or as a lower-priority project config (such as a legacy `.teamai/config.yaml`) behind it. `pull` follows the same rule: it syncs no scope there, prints ``Nothing was synced: <file>: <reason>. Fix the file, or move it aside and run `teamai init` to write a new one.`` and exits 1 (with `--silent`, it prints nothing and still exits 1); a session start there runs no pull, seeds no agent directory and stashes no package hint. A hook whose `cwd` was deleted (a session that outlives its worktree) keeps the scope its session last recorded, so the session's last events and skill uses stay with the project, and its share reminder follows the project's settings, instead of the user scope's. This needs the session's earlier events in the local event log, which compaction trims to active sessions, and does not cover Copilot, whose events record no directory. Self single-repo mode keeps its hooks in the business repo so they travel on clone.
 
@@ -1966,6 +1966,134 @@ is not checked.
 
 `teamai pull` copies these into each Tier-1 tool's `agents/` directory (e.g. `~/.claude/agents/`), flattened by file name, so two active namespaces must not define the same agent name (pull reports the collision and leaves agents as installed for that run; the other resource types still sync). An agent in an active namespace replaces a root-level agent of the same name, and the root one comes back once that namespace stops being active. Without a configured role or project every namespace syncs, so a root-level and a namespaced agent of one name collide too. `teamai pull` writes `<name>.toml` for Codex tools, `<name>.json` for Kiro, `<name>.agent.md` for Copilot, and `<name>.md` for every other tool. When a member changes role, agents of the namespaces that stopped being active are removed on the next pull, unless the deployed copy was edited locally, in which case it is kept with a warning. Without a configured role, every agent syncs. `teamai push` resolves the source using the same active role and project namespaces as pull. It writes edits to that source and skips ambiguous destinations with a warning; an agent with only inactive sources is also skipped. Skipped agents do not block other resources in the same push. A new agent is placed the way a new skill is: `--role <ns>` or `--project <id>` (that project's `agents` namespace) names the directory, and with neither flag it resolves from the primary role's `agents` namespaces. It only stays at the shared root — where every member receives it — when no namespace resolves, and push warns when that happens (see [Push local resources](#push-local-resources)). Cleanup checks each tool separately, respecting YAML `targets` and legacy format support. An active same-named agent protects a deployed file only when it targets that tool and output file. `teamai remove agents <name>` records a tombstone. A namespaced agent can be named as `<namespace>/<name>`; a bare name that only one namespace has resolves to it, and a bare name found in several places is refused, with the qualified names listed, rather than removed from all of them. The next pull on every other machine deletes `<name>.agent.md`, `<name>.md`, `<name>.toml` and `<name>.json` from each synced tool's agents directory. That cleanup also runs when the pull finds the team repo unchanged. Removing a namespaced agent tombstones `<namespace>/<name>` only, so the same name in another namespace is untouched; a member's flattened `<name>` copy is cleaned, and not pushed again, when it can be that agent's copy (the namespace is active for them, or their machine placed the agent) and their directory does not still receive an agent of that name from another active namespace. A member who never had that namespace keeps their own agent of the same name. The CLI's built-in `teamai-recall` profile is deployed alongside team agents but is not uploaded by `teamai push`.
 
+A YAML agent carries tool-specific fields under `tool_extras.<tool>`, and each tool receives only its own key: `tool_extras.claude` reaches Claude alone, `tool_extras.qoder` reaches Qoder, and Qoder CN, ZCode and OMP read `tool_extras.qoder-cn`, `tool_extras.zcode` and `tool_extras.omp`. tclaude and tcodex also receive the fields of `tool_extras.claude` and `tool_extras.codex` that `tool_extras.tclaude` and `tool_extras.tcodex` do not set. `teamai push` writes an edit back to the key that tool reads; for tclaude and tcodex it writes only the values that differ from the base tool's, and skips, with the reason, an edit that removes a field the tool inherits, since only the base tool's key can drop it.
+
+#### Model aliases
+
+A YAML agent can name a kind of model instead of a model: `model: strong`, `model: fast`, or an alias the team defines. The team maps each alias per tool in an optional `models/aliases.yaml`, in the tool's own model value, with an optional reasoning effort:
+
+```yaml
+# models/aliases.yaml
+aliases:
+  strong:
+    claude: [{ model: opus, effort: high }, { model: fable }]
+    codex:  { model: gpt-6-sol, effort: high }
+    opencode: anthropic/claude-opus-5-5
+    cursor: "claude-opus-5[effort=high]"
+  fast:
+    claude: haiku
+    codex:  { model: gpt-6-luna, effort: low }
+  reviewer:
+    claude: [{ model: opus, effort: max }]
+```
+
+- `strong` and `fast` are always aliases, and TeamAI ships no models for them. A team adds its own names, which start with a lowercase letter followed by lowercase letters, digits or hyphens. Any other `model`, such as `opus`, is written as is.
+- A tool entry is one option or an ordered list of them; only the first is used for now. An option is a model string or `{ model, effort }`.
+- Each tool receives the model in its own model field and the effort in its own effort field, and no other tool's keys:
+
+  | Tool | Model | Effort field |
+  |---|---|---|
+  | Claude, claude-internal, tclaude | as written | `effort` |
+  | Codex, codex-internal, tcodex | as written | `model_reasoning_effort`, only when the mapping sets one |
+  | OpenCode | as written (`provider/model`) | `variant` |
+  | CodeBuddy, Qoder, Qoder CN | as written | `effort` |
+  | Cursor | as written, including the bracket form `claude-opus-5[effort=high]` | none; write the effort in the brackets |
+  | Copilot | the first entry, as one model string | none |
+  | Kiro, WorkBuddy, JoyCode, ZCode, OMP | as written | none |
+
+- An `effort` mapped for a tool with no effort field is dropped: the tool receives the model alone, and pull warns once, naming the alias and the tool, when it delivers an agent that uses the alias to that tool.
+- claude-internal and tclaude use the `claude` entry, codex-internal and tcodex the `codex` entry, and Qoder CN the `qoder` entry, unless the alias has a key of their own. No other tool inherits an entry: Qoder, ZCode, OMP and JoyCode never receive the `claude` model.
+- A tool the alias does not map gets no `model` field, so it runs the agent on its default. Without `models/aliases.yaml`, `strong` and `fast` give no model field in any tool.
+- `tool_extras.<tool>.model` pins that tool to a concrete model and skips the alias, its effort included. An effort field in `tool_extras.<tool>` without a model overrides only the alias's effort, and a tool switched to a model profile does not receive it.
+- A `model` that is not a string is rejected when the agent is read. A legacy `agents/<name>.md` is copied as is, so pull warns when its `model` is an alias.
+- A structural error fails the whole file: YAML that does not parse, a value of the wrong type, an alias name that breaks the naming rule, an option with `effort` and no `model`, `~`, or top-level keys without `aliases:` (such as a misspelled `alias:`; an empty file, one with only comments, and an empty `aliases:` define no aliases). Until it is fixed, pull warns, naming the file, and holds every agent with a `model` field (an unreadable file may define any name) in each tool without `tool_extras.<tool>.model`: deployed copies stay, new ones are not written, and the models pull recorded for them stay as they were. Push skips those agents and says why; everything else pushes. Once the file is fixed, an ordinary `teamai pull` delivers the held agents, including ones it never deployed and team changes to them that arrived meanwhile: a pull that holds an agent, on an unchanged team repo too, does not count the team revision as synced, so the next pull syncs in full. `teamai pull --dry-run` names the agents it would hold.
+- Anything else this CLI does not know is dropped with a warning, and the rest of the file applies: a tool key that is not a tool teamai knows, an option field other than `model` and `effort` (the entry is used without it), and an alias named like a tool's own model alias (`opus`, `sonnet`, `haiku`, `fable`, `inherit`, `default`, `auto`, `lite`, a short best-effort list), which is ignored so that `model: opus` stays `opus`. A `gateways` key inside an alias is reserved for a later version and ignored without a warning. Pull prints each warning once, and only when it delivers an agent that uses that alias; a warning about one tool's entry, only when that tool reads the entry.
+- Pull records the model and effort each agent copy received, so an ordinary `teamai pull` applies a change even when the team repo has not moved, such as the first pull after upgrading from a CLI that wrote `model: strong` as is. It rewrites only the agents whose model changed, a copy that is missing, and a copy an older CLI rendered differently that you have not changed since. A copy you edited is kept, and pull names it on each such pull with how to take the new model. When the alias an agent used is removed, pull warns that its `model` is now written as is, also where the alias gave that tool no model field.
+- `default` in `models/aliases.yaml` is a model value like any other and is written as is, which is CodeBuddy's own value for its default model. `~` there is an error: leave the tool out to give it no model field.
+
+##### Adopting aliases
+
+Only a CLI that knows model aliases resolves them, so a team adopts them in two steps:
+
+1. Everyone updates teamai to a version with model aliases. Nothing changes yet: an agent with a concrete model or none is written as before.
+2. Then the team adds `models/aliases.yaml` and moves agents to `model: strong`, `model: fast` or its own aliases, in the team repo or by writing the alias name in a deployed copy and pushing.
+
+An older CLI ignores `models/aliases.yaml` and writes `model: strong` into every tool as is, a model no tool knows. Its `teamai push` also reads a model changed in a deployed copy as an edit, so it can replace `model: strong` in the team's agent with a concrete model such as `opus`. TeamAI does not check versions, so updating first is the only protection. The first ordinary `teamai pull` after a member updates replaces a literal `model: strong` with what the alias resolves to.
+
+##### Namespaced aliases
+
+A role or project gives an alias its own meaning in `models/<ns>/aliases.yaml`, same shape, read where `<ns>` is active in `resources.models` of your roles or projects, as `models/<ns>/models.yaml` is. Legacy mode (no roles, no projects) reads `models/aliases.yaml` alone.
+
+- A namespace alias replaces the root alias of the same name whole: a tool it does not map gets no `model` field, even when `models/aliases.yaml` maps that tool.
+- The same alias in two active namespaces holds agents with a `model` field, as a structural error does, and pull names both files. Rename or remove it in one of them, or stop declaring one of the namespaces.
+- A name that any aliases file in the team repo defines, root or namespace, active for you or not, is an alias. An agent whose alias only an inactive namespace defines gets no `model` field, rather than the name as written, and your local entry for that name still applies. Pull warns once per such alias when it delivers an agent that uses it, naming the files: activate the namespace if the alias should apply to you, or rename the alias if its name was meant as a concrete model, such as `gpt-5-codex`.
+- For the same reason, a structural error in any aliases file of the team repo, including one in a namespace that is not active for you, holds agents with a `model` field, and pull names that file.
+- Pull warnings and push drift name the file an entry comes from, such as `models/checkout/aliases.yaml`. `teamai doctor` notes an alias that agents you receive use when a namespace that is not active for you also defines it.
+
+##### Local override
+
+A member replaces a team entry on their own machine in `~/.teamai/models/aliases.yaml`, which has the same `aliases:` shape:
+
+```yaml
+# ~/.teamai/models/aliases.yaml
+aliases:
+  strong:
+    codex: { model: gpt-6-astra, effort: xhigh }
+  fast:
+    codex: default          # Codex uses its own default for fast
+```
+
+- For each tool, the order is: `tool_extras.<tool>.model`, then your entry, then the team entry, then no model field. A tool switched to a model profile filters the result of your entry or the team entry, as described next. Your entry replaces the team's whole entry for that tool, effort included, so `codex: gpt-6-astra` gives Codex no effort even when the team maps one.
+- `~` or `default` for a tool gives it no model field and no effort, whatever the team maps.
+- A key is a reserved name (`strong`, `fast`) or an alias the team defines, and a value can be any model. You can map `strong` before your team has a `models/aliases.yaml`. A name that is neither has no effect, since the file serves every team on the machine.
+- claude-internal and tclaude use your `claude` entry, codex-internal and tcodex your `codex` entry, and Qoder CN your `qoder` entry, unless you give them their own. Your `claude` entry wins over the team's `tclaude` entry.
+- The file is one per machine: it applies in every scope (user and each project checkout) and to every team that uses the alias name.
+- An ordinary `teamai pull` applies an edit to the file, even when the team repo has not moved.
+- The file follows the same rules as the team file, `~` aside, with one difference: a structural error holds only the agents whose `model` is an alias, since this file can make no name an alias, and the warning names the file by its path. Agents with a concrete model are delivered and pushed as usual. An entry this CLI does not know is dropped with a warning.
+
+##### Tools switched to a model profile
+
+A tool you switched with `teamai models switch` sends its requests to the profile's gateway, which does not know your account's models. For an agent whose `model` is an alias, pull therefore writes only what the switch can route:
+
+- Claude keeps a resolved `opus`, `sonnet` or `haiku`, from your entry or the team's, because the switch points each of these families at a gateway model. Any other model is dropped.
+- Codex, OpenCode, CodeBuddy and WorkBuddy get no `model` field.
+- No switched tool gets an effort, neither the alias's nor one set in `tool_extras.<tool>`, unless `tool_extras.<tool>` also pins a model.
+
+No `model` field means the tool's native inheritance, not the profile's model: Codex, for example, uses `[agents].default_subagent_model` when your config sets one, otherwise the model of the session that starts the agent. `tool_extras.<tool>.model`, a concrete `model` such as `opus`, and your `~` or `default` are written as they are without a switch. The Claude and Codex variants (claude-internal, tclaude, codex-internal, tcodex) are never switched. A tool counts as switched only while its live settings path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) is the one the switch recorded and those settings still hold what TeamAI wrote, the same checks `teamai models restore` makes. While TeamAI cannot read its switch records (`~/.teamai/models/managed.json`), pull warns and holds alias agents in the five tools `models switch` supports; while it cannot read one switched tool's settings, in that tool only. An ordinary `teamai pull` after `teamai models switch` or `teamai models restore` rewrites the affected agents.
+
+##### Push
+
+For an agent whose `model` is an alias, each tool's `model` and the effort field the alias writes belong to the alias, not to the copy:
+
+- A copy with the model and effort the last pull wrote, or the ones a pull would write now, is unedited. So pushing before you pull a change to `models/aliases.yaml`, your override or a switch reports nothing, and push's warning about a kept copy whose deployed version changed ignores such a change.
+- Push never replaces `model: strong` with a concrete model and never writes the alias's effort into `tool_extras`. A model or effort you changed by hand in a copy is drift: push names the copy and where the value comes from, leaves the change out, and says where to make it: your override file for an entry that comes from it, your override file or the team aliases file the alias comes from (`models/aliases.yaml` or `models/<ns>/aliases.yaml`) for a team entry or an unmapped tool, `teamai models restore --agent <tool>` for a switched tool. `teamai push --dry-run` reports it too. Your other edits to that agent, such as its instructions or other fields, still push.
+- To move an agent to another alias, write the alias name in a deployed copy, such as `model: fast` in place of `opus`, or `model: strong` in an agent that set `model: opus`, and push: push proposes `model: <alias>`. In a tool whose `tool_extras.<tool>.model` pins the model, the copy does not adopt an alias; a changed value there is reported as drift on that pin. Two copies that name different aliases conflict, as any two different values do.
+- A new agent that exists only in a tool's directory is pushed with the model it has there, which is never turned back into an alias.
+
+##### Checking with doctor
+
+`teamai doctor` answers "why does Codex run this model". For each agent whose `model` is an alias, it prints a note with one line per installed tool the agent targets: the model and effort the tool receives, and in brackets the step that decided it. Agents and tools that resolve alike share a line; agents with a concrete model or none are left out, since they are written as their spec says.
+
+```text
+models: how model: strong resolves for agents implementer, planner:
+    claude: opus, effort high  [team: models/aliases.yaml]
+    codex: gpt-6-astra, effort xhigh  [local: /home/me/.teamai/models/aliases.yaml]
+    opencode: tool default  [default: models/aliases.yaml does not map opencode]
+```
+
+| Step | Meaning |
+|---|---|
+| `extras` | `tool_extras.<tool>.model` pins the model; the alias is skipped |
+| `switched` | the tool is switched to a model profile: Claude keeps `opus`, `sonnet` or `haiku`, other tools get no model field and pick one natively |
+| `local` | your entry in `~/.teamai/models/aliases.yaml`; `tool default (chosen in <path>)` is your `~` or `default` |
+| `team` | the team entry, in the file named |
+| `default` | no model field: the alias does not map the tool, or no active aliases file defines it |
+
+- A Codex-family line with a model and no effort says so: the effort of the session that starts the agent carries over.
+- When the last pull deployed something else, such as before you pull an edit to your override, the line names what is deployed; an ordinary `teamai pull` updates it, and `Agents delivered to <tool>` lists the agent as `model changed since the last pull` without failing.
+- Every entry an aliases file sets that this CLI drops is a note too.
+- `Agent model aliases can be resolved` fails while a structural error in any aliases file (active or not, your own included), one alias in two active namespaces, or a switched tool whose settings cannot be read holds agents. It names the reason, the file and the held agents, as pull's own warning does.
+
 ### GitHub Copilot CLI
 
 GitHub Copilot CLI is supported for its official custom-instructions, Rules, Skills, custom-agent, hooks, and MCP surfaces, plus TeamAI Docs and Env delivery:
@@ -2437,7 +2565,7 @@ Notify external endpoints when team events happen. Each endpoint declares a `url
 | `session-stop` | An AI session ends (includes Copilot's `SessionEnd`) |
 | `skill-use` | A skill is invoked |
 | `push` | `teamai push` **actually completes a real push** — not on `--dry-run`, a cancelled selection, a no-change run, or a failed PR creation |
-| `pull` | `teamai pull` completes a real (non-`--dry-run`) sync |
+| `pull` | `teamai pull` completes a real (non-`--dry-run`) sync — not when it held an agent whose model it could not resolve |
 | `*` | Wildcard — subscribe to every event above |
 
 **Payload.** Only whitelisted, non-sensitive fields are sent: `skillName` for `skill-use`, `sessionId` for session events; `push`/`pull` carry the event and metadata only. Raw tool input and tool output are **never** forwarded, and the whole body is passed through teamai's secret redactor before it leaves the machine.

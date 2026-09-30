@@ -16,6 +16,7 @@ import { pathExists, remove, listFiles, listDirs, listFilesRecursive, readFileSa
 import { reconcilePlacementRecords } from './utils/pending-push.js';
 import { injectClaudeMdSection, removeClaudeMdSection } from './utils/claudemd.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
+import { reportHeldAgents, type RedeployedCopy } from './resources/agents.js';
 import { listStaleDocDirectories, resolveDesiredDocs, resolveDocsDestination } from './resources/docs.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { skillsDirForTool } from './resources/skills.js';
@@ -25,7 +26,7 @@ import {
   forgetDelivered, judgeCopy, openLedger, removedCopyChanged, reportKept, type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
-import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
+import type { AgentModelRecords, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
 import {
   getUserLearningsDir,
   TEAMAI_CULTURE_START,
@@ -731,16 +732,127 @@ export async function userScopeRecord(state: State): Promise<CheckoutRecord> {
   return record;
 }
 
+/** The record of the checkout `localConfig`'s pulls deliver into, if any. */
+async function deliveringCheckoutRecord(localConfig: LocalConfig, state?: State): Promise<CheckoutRecord | undefined> {
+  const key = await checkoutRecordKey(localConfig);
+  if (!key) return undefined;
+  return (state ?? await loadStateForScope(localConfig)).lastPullByWorkspace?.[key];
+}
+
 /**
  * What teamai last wrote at each skill, rule and agent file of the checkout
  * `localConfig`'s pulls deliver into, or undefined when nothing is recorded
  * yet (#822).
  */
 export async function deliveredHashes(localConfig: LocalConfig, state?: State): Promise<DeliveredHashes | undefined> {
-  const key = await checkoutRecordKey(localConfig);
-  if (!key) return undefined;
-  return (state ?? await loadStateForScope(localConfig)).lastPullByWorkspace?.[key]?.delivered;
+  return (await deliveringCheckoutRecord(localConfig, state))?.delivered;
 }
+
+/**
+ * The model and effort each agent copy in that checkout received when teamai
+ * last wrote it, by stem and tool (#830). Empty when nothing is recorded.
+ * The user scope's and each project checkout's records are separate, as
+ * their copies are.
+ */
+export async function recordedAgentModels(localConfig: LocalConfig, state?: State): Promise<AgentModelRecords> {
+  return (await deliveringCheckoutRecord(localConfig, state))?.agentModels ?? {};
+}
+
+/** Put `agentModels` on `record`, leaving the key out while there are none. */
+function setAgentModels(record: CheckoutRecord, agentModels: AgentModelRecords): void {
+  if (Object.keys(agentModels).length > 0) record.agentModels = agentModels;
+  else delete record.agentModels;
+}
+
+/** The ledger a pull of that checkout starts from (see DeliveryLedger). */
+async function openCheckoutLedger(localConfig: LocalConfig, state?: State): Promise<DeliveryLedger> {
+  const record = await deliveringCheckoutRecord(localConfig, state);
+  return openLedger(record?.delivered, record?.agentModels);
+}
+
+/**
+ * Agents on the "Already synced" fast path (#830): an agent's model can
+ * change while the team repo stays put — a CLI upgrade that resolves an alias
+ * an older one wrote literally, and later the member's own alias file or a
+ * switched tool — and an older CLI may have rendered a copy differently.
+ * Only the agents `agentsToRedeploy` selects are redeployed, through the same
+ * `pullItem` a full sync uses, so a copy the member changed is kept. No git work: this
+ * runs on every session start. Returns whether it held an agent for its model.
+ */
+async function redeployAgentsWithChangedModels(
+  freshConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  roleContext: RolePullContext | null,
+  scopeLabel: string,
+  revisionField: 'lastPullRev' | 'lastInheritedPullRev',
+  reported: Set<string>,
+): Promise<boolean> {
+  try {
+    const key = await checkoutRecordKey(localConfig);
+    if (!key) return false;
+    const desired = await resolveDesiredAgents(freshConfig, localConfig, roleContext);
+    // The full sync that met this collision said so and kept the installed agents.
+    if (desired.kind === 'conflict') return false;
+    const state = await loadStateForScope(localConfig);
+    const ledger = await openCheckoutLedger(localConfig, state);
+    const handler = getHandler('agents') as AgentsHandler;
+    const redeploy = await handler.agentsToRedeploy(desired.items, freshConfig, localConfig, ledger);
+    for (const { item } of redeploy) await handler.pullItem(item, freshConfig, localConfig, ledger);
+    // Said as a full sync says it, and the checkout not counted as synced, so
+    // the next pull syncs in full and delivers what this one held.
+    const held = ledger.held.length > 0;
+    if (redeploy.length === 0 && !held) {
+      // A copy kept for the member's edit changes nothing on record.
+      reportKept(ledger, scopeLabel);
+      return false;
+    }
+    if (held && reportHeldAgents(ledger) > 0) reported.add('model-aliases');
+    reportKept(ledger, scopeLabel);
+    // A project checkout reaches the fast path only through its own record.
+    const record = localConfig.scope === 'user' ? await userScopeRecord(state) : state.lastPullByWorkspace?.[key];
+    if (!record) return held;
+    record.delivered = ledger.hashes;
+    setAgentModels(record, ledger.agentModels);
+    if (held) {
+      // What gates this checkout's fast path: a project checkout's own record,
+      // reset as a forced full sync resets it, push bases kept; for the user
+      // scope, the revision field.
+      if (localConfig.scope === 'project' && revisionField === 'lastPullRev') {
+        state.lastPullByWorkspace = { ...state.lastPullByWorkspace, ...awaitingFullSync({ [key]: record }) };
+      } else {
+        state[revisionField] = null;
+      }
+    }
+    await saveStateForScope(state, localConfig);
+    // Named by what happened to the copies pull did write, the first reason that applies.
+    const written = new Map<RedeployedCopy['reason'], string[]>();
+    for (const { item, copies } of redeploy) {
+      const wrote = new Set<RedeployedCopy['reason']>();
+      for (const copy of copies) {
+        if (await readFileSafe(copy.dest) === copy.content) wrote.add(copy.reason);
+      }
+      const reason = (['model', 'missing', 'render'] as const).find((candidate) => wrote.has(candidate));
+      if (reason) written.set(reason, [...written.get(reason) ?? [], item.name]);
+    }
+    for (const [reason, names] of written) {
+      log.success(`[${scopeLabel}] ${REDEPLOYED[reason](names.length)}: ${names.join(', ')}`);
+    }
+    return held;
+  } catch (e) {
+    log.warn(
+      `[${scopeLabel}] Could not check whether agent models changed: ${(e as Error).message}. `
+      + 'Deployed agents may still carry the previous model; fix the cause, then run `teamai pull --force`.',
+    );
+    return false;
+  }
+}
+
+/** How the fast path names the agents it wrote, by why it wrote them. */
+const REDEPLOYED: Record<RedeployedCopy['reason'], (count: number) => string> = {
+  model: (count) => `Updated the model of ${count} agent(s)`,
+  missing: (count) => `Delivered ${count} agent(s) missing from a tool`,
+  render: (count) => `Re-rendered ${count} agent(s) an older teamai wrote differently`,
+};
 
 /**
  * `records` after a forced full sync: see FORCED_FULL_SYNC_REV. Each keeps
@@ -754,6 +866,7 @@ function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<strin
       rev: FORCED_FULL_SYNC_REV,
       targets: record.targets,
       ...(record.delivered ? { delivered: record.delivered } : {}),
+      ...(record.agentModels ? { agentModels: record.agentModels } : {}),
     };
     return [key, pushBaseRevs.length === 0 ? reset : { ...reset, pushBaseRevs }];
   }));
@@ -774,7 +887,7 @@ async function pullForScope(
     revisionField?: 'lastPullRev' | 'lastInheritedPullRev';
   } = {},
   /** Set to `{ completed: true }` on a real (non-dry-run) sync. See pull(). */
-  result?: { completed: boolean; docsSyncFailed: boolean },
+  result?: { completed: boolean; docsSyncFailed: boolean; agentModelsHeld: boolean },
   /** Collects this scope's env resolution for the stages after it (see resolvePullEnv). */
   teamEnvs?: Map<LocalConfig, TeamEnv>,
 ): Promise<void> {
@@ -1111,6 +1224,12 @@ async function pullForScope(
           // CLI keeps the copies that CLI failed to delete, and its stored rev
           // never moves again. Re-run the cleanup so the upgrade reaches it (#576).
           await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, openLedger(await deliveredHashes(localConfig, state)));
+          // The repo has not moved, but an agent's model may have (#830).
+          if (resourceTypes.includes('agents')) {
+            if (await redeployAgentsWithChangedModels(freshConfig, localConfig, roleContext, scopeLabel, revisionField, reported) && result) {
+              result.agentModelsHeld = true;
+            }
+          }
           // A repo that has not moved can still carry a malformed env.yaml, or
           // scope a variable this CLI version now withholds; the Step 2 env
           // branch below is unreachable from here.
@@ -1142,7 +1261,7 @@ async function pullForScope(
 
   // What teamai last wrote into this checkout: a copy changed since is kept,
   // and this pull's writes are recorded when the state is saved (#822).
-  const ledger = openLedger(await deliveredHashes(localConfig));
+  const ledger = await openCheckoutLedger(localConfig);
 
   // Step 2: Sync each resource type
   let totalSynced = 0;
@@ -1153,6 +1272,11 @@ async function pullForScope(
   let skillsHeld = false;
   // Set on the same collision among agents.
   let agentsHeld = false;
+  // Set when an agent's model could not be resolved in some tool (#830). Its
+  // cause may be the member's own (their aliases override, the switch state),
+  // which they fix without a new team revision, so the next pull must sync
+  // again to deliver what was held.
+  let agentModelsHeld = false;
   let knownRepoSkillNames: Set<string> | null = null;
   // name → team-repo source dir, for the data-safety check in Step 3b cleanup.
   let knownRepoSkillSources: Map<string, string> | null = null;
@@ -1273,10 +1397,18 @@ async function pullForScope(
     if (options.dryRun) {
       const added = items.filter(i => !existingNames.has(i.name));
       const updated = items.filter(i => existingNames.has(i.name));
+      // The agents the real pull would hold for their model, said as it says them.
+      let held = 0;
+      if (type === 'agents') {
+        await (handler as AgentsHandler).queueModelHolds(items, freshConfig, localConfig, ledger);
+        held = reportHeldAgents(ledger, scopeLabel);
+      }
 
       if (added.length > 0 && type === 'skills') {
         log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type} (${added.length} new, ${updated.length} updated)`);
         log.dim(`    new: ${added.map(i => i.name).join(', ')}`);
+      } else if (held > 0) {
+        log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length - held} ${type} (${held} held)`);
       } else {
         log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type}`);
       }
@@ -1301,10 +1433,16 @@ async function pullForScope(
       for (const item of items) {
         await handler.pullItem(item, freshConfig, localConfig, ledger);
       }
+      // Agents whose model cannot be resolved reach no tool: said once per reason, and not counted as synced.
+      if (ledger.held.length > 0) agentModelsHeld = true;
+      const held = ledger.held.length > 0 ? reportHeldAgents(ledger) : 0;
+      if (held > 0) reported.add('model-aliases');
 
       if (canReceive) {
         if (type === 'skills') {
           logSyncDetail(type, items, existingNames, !!options.verbose, scopeLabel, skippedByTags);
+        } else if (held > 0) {
+          log.success(`[${scopeLabel}] Synced ${items.length - held} ${type} (${held} held)`);
         } else {
           log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
         }
@@ -1504,11 +1642,11 @@ async function pullForScope(
         state.lastPull = new Date().toISOString();
       }
       // A failed submodule update keeps the previous rev so the next pull
-      // retries the update (see refreshTeamRepo).
-      if (!submodulesFailed) state[revisionField] = deliveredRev;
+      // retries the update (see refreshTeamRepo); so does a held agent.
+      if (!submodulesFailed && !agentModelsHeld) state[revisionField] = deliveredRev;
       state[targetsField] = syncedTargets;
     }
-    const complete = !docsSyncFailed && !submodulesFailed;
+    const complete = !docsSyncFailed && !submodulesFailed && !agentModelsHeld;
     if (recordKey && deliveredRev && (!complete || revisionField === 'lastInheritedPullRev')) {
       // An inherited pull moves HOME's skills, rules and agents, not the rest,
       // and an incomplete one keeps its marker for a retry, yet both delivered
@@ -1519,6 +1657,7 @@ async function pullForScope(
         : state.lastPullByWorkspace?.[recordKey] ?? { rev: FORCED_FULL_SYNC_REV, targets: syncedTargets };
       addPushBaseRev(record, deliveredRev);
       record.delivered = ledger.hashes;
+      setAgentModels(record, ledger.agentModels);
       state.lastPullByWorkspace = { ...state.lastPullByWorkspace, [recordKey]: record };
     } else if (recordKey && deliveredRev) {
       // A forced full sync (lastPullRev cleared) leaves every other checkout
@@ -1533,6 +1672,7 @@ async function pullForScope(
         : undefined;
       const others = previousRev === null && live ? awaitingFullSync(live) : live;
       const record: CheckoutRecord = { rev: deliveredRev, targets: syncedTargets, delivered: ledger.hashes };
+      setAgentModels(record, ledger.agentModels);
       state.lastPullByWorkspace = {
         ...others,
         [recordKey]: keptBases.length > 0 ? { ...record, pushBaseRevs: keptBases } : record,
@@ -1591,7 +1731,9 @@ async function pullForScope(
   // A real sync ran to completion for this scope. The "Already synced" fast path
   // and every error/skip path return before here, and dry-run is excluded so a
   // preview never reports completion (#702 follow-up).
-  if (result && !options.dryRun && !docsSyncFailed) result.completed = true;
+  // A held agent is not delivered either (#830).
+  if (result && agentModelsHeld) result.agentModelsHeld = true;
+  if (result && !options.dryRun && !docsSyncFailed && !agentModelsHeld) result.completed = true;
 }
 
 /**
@@ -1950,7 +2092,8 @@ export async function pull(
    * Optional out-param: set to `{ completed: true }` only when a scope performed
    * a real (non-dry-run) sync. Left false on dry-run, the "Already synced" fast
    * path, and error/skip paths — so the CLI does not fire a misleading "Pull
-   * Complete" webhook on those (#702 follow-up).
+   * Complete" webhook on those (#702 follow-up). Also false when any scope
+   * failed to sync docs or held an agent for its model (#830).
    */
   result?: { completed: boolean },
 ): Promise<void> {
@@ -1962,7 +2105,7 @@ export async function pull(
   // into another call.
   const reported = new Set<string>();
   // A later successful scope must not hide an earlier docs failure (or vice versa).
-  const syncResult = { completed: false, docsSyncFailed: false };
+  const syncResult = { completed: false, docsSyncFailed: false, agentModelsHeld: false };
   // Each scope's env, resolved once by its env stage (resolvePullEnv).
   const teamEnvs = new Map<LocalConfig, TeamEnv>();
 
@@ -2253,7 +2396,7 @@ export async function pull(
   //    transient branch is how a diagnostic invents a failure.
   await reportPostPullChecks(options, reported, contended.size > 0);
   } finally {
-    if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed;
+    if (result) result.completed = syncResult.completed && !syncResult.docsSyncFailed && !syncResult.agentModelsHeld;
     const releaseSyncLocks = async () => {
       for (const lock of heldLocks.values()) await releaseLock(lock);
     };

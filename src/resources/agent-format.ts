@@ -152,6 +152,11 @@ export function parseAgentYaml(content: string, filename: string): ParseResult {
     }
   }
 
+  // A list or a number would reach every tool file as is; a blank `model:` is null.
+  if (obj['model'] !== undefined && typeof obj['model'] !== 'string') {
+    return { ok: false, reason: `${filename} field model must be a string (a model or a model alias); remove it to use each tool's default` };
+  }
+
   return {
     ok: true,
     spec: {
@@ -194,28 +199,6 @@ export function renderForClaude(spec: AgentSpec): RenderResult {
   return {
     ext: agentFileExtensionForTool('claude'),
     content: renderMarkdownAgent(spec, spec.tool_extras?.['claude']),
-  };
-}
-
-/**
- * Render an AgentSpec for Claude Internal.
- * Same format as Claude — YAML frontmatter + body.
- */
-export function renderForClaudeInternal(spec: AgentSpec): RenderResult {
-  return {
-    ext: agentFileExtensionForTool('claude-internal'),
-    content: renderMarkdownAgent(spec, spec.tool_extras?.['claude-internal']),
-  };
-}
-
-/**
- * Render an AgentSpec for CodeBuddy.
- * Same format as Claude, but merges tool_extras.codebuddy into frontmatter.
- */
-export function renderForCodebuddy(spec: AgentSpec): RenderResult {
-  return {
-    ext: agentFileExtensionForTool('codebuddy'),
-    content: renderMarkdownAgent(spec, spec.tool_extras?.['codebuddy']),
   };
 }
 
@@ -296,17 +279,6 @@ export function renderForCodex(spec: AgentSpec): RenderResult {
   return {
     ext: agentFileExtensionForTool('codex'),
     content: renderTomlAgent(spec, spec.tool_extras?.['codex']),
-  };
-}
-
-/**
- * Render an AgentSpec for Codex Internal.
- * Same format as Codex — TOML with developer_instructions.
- */
-export function renderForCodexInternal(spec: AgentSpec): RenderResult {
-  return {
-    ext: agentFileExtensionForTool('codex-internal'),
-    content: renderTomlAgent(spec, spec.tool_extras?.['codex-internal']),
   };
 }
 
@@ -392,7 +364,7 @@ export function renderForCopilot(spec: AgentSpec): RenderResult {
  * a team that needs per-tool permissions carries them in tool_extras.opencode
  * (e.g. `permission: { edit: deny }`), which is flattened into the frontmatter.
  */
-export function renderForOpencode(spec: AgentSpec): RenderResult {
+export function renderForOpencode(spec: AgentSpec, resolved?: Record<string, unknown>): RenderResult {
   const frontmatterData: Record<string, unknown> = {
     description: spec.description,
     mode: 'subagent',
@@ -400,6 +372,8 @@ export function renderForOpencode(spec: AgentSpec): RenderResult {
   if (spec.model !== undefined) {
     frontmatterData['model'] = spec.model;
   }
+  // Resolved fields go before the extras, so an extras value overrides them.
+  Object.assign(frontmatterData, resolved);
   // Flatten tool_extras.opencode into frontmatter (mode/permission/temperature/…).
   const extras = spec.tool_extras?.['opencode'];
   if (extras) {
@@ -416,7 +390,7 @@ export function renderForOpencode(spec: AgentSpec): RenderResult {
 /**
  * Build a gray-matter .md file: YAML frontmatter (name/description/model?/tools?/extras) + body.
  */
-function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>): string {
+function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>, resolved?: Record<string, unknown>): string {
   const frontmatterData: Record<string, unknown> = {
     name: spec.name,
     description: spec.description,
@@ -427,6 +401,8 @@ function renderMarkdownAgent(spec: AgentSpec, extras?: Record<string, unknown>):
   if (spec.tools !== undefined && spec.tools.length > 0) {
     frontmatterData['tools'] = spec.tools;
   }
+  // Resolved fields go before the extras, so an extras value overrides them.
+  Object.assign(frontmatterData, resolved);
   // Flatten tool-private extras into frontmatter
   if (extras) {
     for (const [key, value] of Object.entries(extras)) {
@@ -476,7 +452,7 @@ function tomlStringLiteral(value: string): string {
  * Build a smol-toml TOML file: name/description/developer_instructions/model?/extras.
  * Note: `tools` is intentionally omitted from TOML output — Codex uses mcp_servers instead.
  */
-function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>): string {
+function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>, resolved?: Record<string, unknown>): string {
   const tomlData: Record<string, unknown> = {
     name: spec.name,
     description: spec.description,
@@ -485,6 +461,8 @@ function renderTomlAgent(spec: AgentSpec, extras?: Record<string, unknown>): str
   if (spec.model !== undefined) {
     tomlData['model'] = spec.model;
   }
+  // Resolved fields go before the extras, so an extras value overrides them.
+  Object.assign(tomlData, resolved);
   // Flatten tool-private extras into top-level TOML fields
   if (extras) {
     for (const [key, value] of Object.entries(extras)) {
@@ -906,30 +884,90 @@ export function mergeReverseResults(
 // ─── Dispatch helpers ─────────────────────────────────────────────────────────
 
 /**
+ * The tools whose extras also carry the keys another tool's extras set:
+ * tclaude reads `tool_extras.claude`, tcodex `tool_extras.codex`. Model
+ * alias inheritance is a separate, wider table (`ALIAS_BASE_TOOL`).
+ */
+export const EXTRAS_BASE_TOOL: Readonly<Partial<Record<ToolName, ToolName>>> = { tclaude: 'claude', tcodex: 'codex' };
+
+/**
+ * The extras `tool` renders: its own `tool_extras.<tool>`. tclaude and tcodex
+ * also fill the keys they lack from `claude` and `codex`; their own value wins.
+ */
+export function toolExtrasFor(spec: AgentSpec, tool: ToolName): Record<string, unknown> | undefined {
+  const extras = spec.tool_extras;
+  const base = EXTRAS_BASE_TOOL[tool];
+  return base ? { ...extras?.[base], ...extras?.[tool] } : extras?.[tool];
+}
+
+/** The agent-file field `tool` reads a reasoning effort from, if it has one. */
+export function agentEffortField(tool: ToolName): string | undefined {
+  switch (tool) {
+    case 'claude':
+    case 'claude-internal':
+    case 'tclaude':
+    case 'codebuddy':
+    case 'qoder':
+    case 'qoder-cn':
+      return 'effort';
+    case 'codex':
+    case 'codex-internal':
+    case 'tcodex':
+      return 'model_reasoning_effort';
+    case 'opencode':
+      return 'variant';
+    default:
+      return undefined;
+  }
+}
+
+/** A model and effort resolved for one tool, replacing the spec's own `model`. */
+export interface ResolvedAgentModel {
+  model?: string;
+  effort?: string;
+}
+
+/**
  * Render an AgentSpec for the specified tool.
+ *
+ * With `resolved`, its model replaces `spec.model` (none when it has none) and
+ * its effort is written in the tool's effort field, both before the extras.
  *
  * @param spec - The agent specification.
  * @param tool - Target tool name.
+ * @param resolved - The model and effort resolved for this tool, if any.
  * @returns Rendered file extension and content.
  */
-export function renderForTool(spec: AgentSpec, tool: ToolName): RenderResult {
+export function renderForTool(spec: AgentSpec, tool: ToolName, resolved?: ResolvedAgentModel): RenderResult {
+  const target = resolved ? withModel(spec, resolved.model) : spec;
+  const effortField = agentEffortField(tool);
+  const fields = effortField && resolved?.effort !== undefined ? { [effortField]: resolved.effort } : undefined;
+  const ext = agentFileExtensionForTool(tool);
   switch (tool) {
-    case 'claude': return renderForClaude(spec);
-    case 'claude-internal': return renderForClaudeInternal(spec);
-    case 'tclaude': return renderForClaude(spec);
-    case 'codebuddy': return renderForCodebuddy(spec);
-    case 'codex': return renderForCodex(spec);
-    case 'codex-internal': return renderForCodexInternal(spec);
-    case 'tcodex': return renderForCodex(spec);
-    case 'cursor': return renderForCursor(spec);
-    case 'copilot': return renderForCopilot(spec);
-    case 'joycode': return renderForJoycode(spec);
-    case 'qoder': return renderForClaude(spec);
-    case 'qoder-cn': return renderForClaude(spec);
-    case 'kiro': return renderForKiro(spec);
-    case 'zcode': return renderForClaude(spec);
-    case 'omp': return renderForClaude(spec);
-    case 'opencode': return renderForOpencode(spec);
-    case 'workbuddy': return renderForWorkbuddy(spec);
+    case 'claude':
+    case 'claude-internal':
+    case 'tclaude':
+      return { ext, content: renderMarkdownAgent(target, toolExtrasFor(spec, tool), fields) };
+    case 'codex':
+    case 'codex-internal':
+    case 'tcodex':
+      return { ext, content: renderTomlAgent(target, toolExtrasFor(spec, tool), fields) };
+    case 'codebuddy':
+    case 'qoder':
+    case 'qoder-cn':
+    case 'zcode':
+    case 'omp':
+      return { ext, content: renderMarkdownAgent(target, toolExtrasFor(spec, tool), fields) };
+    case 'cursor': return renderForCursor(target);
+    case 'copilot': return renderForCopilot(target);
+    case 'joycode': return renderForJoycode(target);
+    case 'kiro': return renderForKiro(target);
+    case 'opencode': return renderForOpencode(target, fields);
+    case 'workbuddy': return renderForWorkbuddy(target);
   }
+}
+
+function withModel(spec: AgentSpec, model: string | undefined): AgentSpec {
+  const { model: _replaced, ...rest } = spec;
+  return model === undefined ? rest : { ...rest, model };
 }
