@@ -990,6 +990,49 @@ servers:
       expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
     });
 
+    it('never lets a tool that maps a moved tool\'s file today claim its stale server under another key', async () => {
+      const opencode = { skills: '.opencode/skills', mcp: '.config/opencode/opencode.json', mcpProject: '.mcp.json' };
+      const before = { ...teamConfig, toolPaths: { ...TOOL_PATHS, cursor: { ...TOOL_PATHS.cursor, mcpProject: '.mcp.json' }, opencode } } as TeamaiConfig;
+      const after = { ...teamConfig, toolPaths: { ...TOOL_PATHS, opencode } } as TeamaiConfig;
+      await fse.ensureDir(path.join(projectRoot, '.opencode', 'skills'));
+      const open = '  - name: open\n    transport: http\n    url: https://example.com/open\n    tools: [claude]\n';
+      await writeMcpYaml(`servers:\n  - name: x\n    transport: http\n    url: https://example.com/x\n    headers:\n      Authorization: Bearer \${SECRET_TOKEN}\n    tools: [cursor]\n${open}`);
+      await reconcileMcpForConfig(before, projectConfig);
+      expect(await fse.readFile(path.join(projectRoot, '.mcp.json'), 'utf-8')).toContain('super-secret-value');
+      // Cursor moves back to .cursor/mcp.json; OpenCode, on .mcp.json, now owns a literal x under `mcp`.
+      await writeMcpYaml(`servers:\n  - name: x\n    transport: http\n    url: https://example.com/x\n    tools: [opencode]\n${open}`);
+      vi.stubEnv('SECRET_TOKEN', '');
+      await fse.writeFile(path.join(projectRoot, '.git', 'info', 'exclude'), '');
+
+      await reconcileMcpForConfig(after, projectConfig);
+
+      expect(await fse.readFile(path.join(projectRoot, '.mcp.json'), 'utf-8')).toContain('super-secret-value');
+      expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+    });
+
+    it('never lets a tool that maps a moved Copilot\'s file today claim its stale bare server by the name it owns under mcpServers', async () => {
+      const copilot = { skills: '.github/skills', mcp: '.copilot/mcp-config.json' };
+      const before = { ...teamConfig, toolPaths: { ...TOOL_PATHS, copilot: { ...copilot, mcpProject: '.mcp.json' } } } as TeamaiConfig;
+      const after = { ...teamConfig, toolPaths: { ...TOOL_PATHS, copilot: { ...copilot, mcpProject: '.github/mcp.json' } } } as TeamaiConfig;
+      await fse.ensureDir(path.join(projectRoot, '.github', 'skills'));
+      // An empty file reads as Copilot's bare map: its write stays bare.
+      await fse.writeFile(path.join(projectRoot, '.mcp.json'), '');
+      await writeMcpYaml(`${withSecret}    tools: [copilot]\n`);
+      await reconcileMcpForConfig(before, projectConfig);
+      expect((await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>)['with-secret']).toBeDefined();
+      // Copilot moves to .github/mcp.json; Claude, on .mcp.json, now owns a literal with-secret under mcpServers.
+      await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'published-literal')}    tools: [claude]\n`);
+      vi.stubEnv('SECRET_TOKEN', '');
+      await fse.writeFile(path.join(projectRoot, '.git', 'info', 'exclude'), '');
+
+      await reconcileMcpForConfig(after, projectConfig);
+
+      const doc = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+      expect((doc.mcpServers as Record<string, unknown>)['with-secret']).toBeDefined();
+      expect(JSON.stringify(doc['with-secret'])).toContain('super-secret-value');
+      expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+    });
+
     it('never lets one format\'s record claim a server of the same name under another format\'s key', async () => {
       const toolPaths = {
         ...UNMOVED_TOOL_PATHS,
@@ -1051,6 +1094,241 @@ servers:
 
       expect(await fse.readFile(path.join(projectRoot, '.mcp.json'), 'utf-8')).toContain('super-secret-value');
       expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+    });
+
+    // No pull writes an HTTP team's servers, but one lists what an older local agent's install_mcp left unlisted.
+    describe('for an HTTP-backed team, a config an older local agent wrote a credential into', () => {
+      let httpConfig: LocalConfig;
+      const file = (): string => path.join(projectRoot, '.mcp.json');
+      const written = { mcpServers: { clawpro: { type: 'http', url: 'https://clawpro.example.com/mcp', headers: { Authorization: 'Bearer bmcp-old-token' } } } };
+
+      beforeEach(async () => {
+        httpConfig = { ...projectConfig, repo: { ...projectConfig.repo, kind: 'http', url: 'https://teamai.example' } } as LocalConfig;
+        await fse.writeJson(file(), written);
+        const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+        // Without the `resolved` note an install on this version adds.
+        await fse.outputJson(managedMcpManifestPath(getDataHome(httpConfig), projectRoot), { 'claude:project': [{ name: 'clawpro', hash: 'h' }] });
+      });
+
+      it('lists it in .git/info/exclude on a pull, and records it in managed-mcp-files.json', async () => {
+        await reconcileMcpForConfig(teamConfig, httpConfig);
+
+        expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+        expect(git(projectRoot, 'status', '--porcelain', '--untracked-files=all', '--', '.mcp.json')).toBe('');
+        const { readResolvedMcpFiles } = await import('../mcp-resolved-files.js');
+        expect((await readResolvedMcpFiles(httpConfig)).files).toEqual({ [file()]: { tools: ['claude'] } });
+        expect(await fse.readJson(file())).toEqual(written);
+      });
+
+      it('writes nothing on a dry run', async () => {
+        await reconcileMcpForConfig(teamConfig, httpConfig, { dryRun: true });
+
+        expect(await excludeOf(projectRoot)).not.toMatch(/\.mcp\.json/);
+        const { resolvedMcpFilesPath } = await import('../mcp-resolved-files.js');
+        expect(await fse.pathExists(resolvedMcpFilesPath(httpConfig) ?? '')).toBe(false);
+      });
+    });
+
+    describe('a bare Copilot config another tool then writes mcpServers into (Copilot and Claude on .mcp.json)', () => {
+      const shared = (): TeamaiConfig => ({
+        ...teamConfig,
+        toolPaths: { ...TOOL_PATHS, copilot: { skills: '.github/skills', mcp: '.copilot/mcp-config.json', mcpProject: '.mcp.json' } },
+      } as TeamaiConfig);
+      const open = 'servers:\n  - name: open\n    transport: http\n    url: https://example.com/open\n    tools: [claude]\n';
+
+      beforeEach(async () => {
+        await fse.ensureDir(path.join(projectRoot, '.github', 'skills'));
+        // An empty file reads as Copilot's bare map: its first write stays bare.
+        await fse.writeFile(path.join(projectRoot, '.mcp.json'), '');
+        await writeMcpYaml(`${withSecret}    tools: [copilot]\n`);
+        await reconcileMcpForConfig(shared(), projectConfig);
+        const first = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+        expect(first['with-secret']).toEqual(expect.objectContaining({ headers: { Authorization: 'Bearer super-secret-value' } }));
+        expect(first.mcpServers).toBeUndefined();
+      });
+
+      it('does not infer bare ownership from an unchanged entry with a legacy record', async () => {
+        const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+        const manifestFile = managedMcpManifestPath(getDataHome(projectConfig), projectRoot);
+        const manifest = await fse.readJson(manifestFile);
+        delete manifest['copilot:project'][0].bare;
+        await fse.writeJson(manifestFile, manifest);
+        const bare = (await fse.readJson(path.join(projectRoot, '.mcp.json')))['with-secret'];
+
+        await reconcileMcpForConfig(shared(), projectConfig);
+        expect((await fse.readJson(manifestFile))['copilot:project'][0].bare).toBeUndefined();
+        await writeMcpYaml(open);
+        await reconcileMcpForConfig(shared(), { ...projectConfig, disabledAgents: ['copilot'] } as LocalConfig);
+        await reconcileMcpForConfig(shared(), projectConfig);
+
+        expect((await fse.readJson(path.join(projectRoot, '.mcp.json')))['with-secret']).toEqual(bare);
+      });
+
+      it.each(['update', 'drop', 'remove', 'missing-secret'] as const)('preserves a member-owned keyed Copilot entry after a bare write during %s', async (action) => {
+        const file = path.join(projectRoot, '.mcp.json');
+        const mine = { type: 'http', tools: ['*'], url: 'https://member.example/mcp' };
+        const doc = await fse.readJson(file);
+        await fse.writeJson(file, { ...doc, mcpServers: { 'with-secret': mine } });
+        if (action === 'update') await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'new-team-value')}    tools: [copilot]\n`);
+        if (action === 'drop') await writeMcpYaml('servers: []\n');
+        if (action === 'missing-secret') {
+          await fse.outputFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: SECRET_TOKEN\n');
+          vi.stubEnv('SECRET_TOKEN', '');
+        }
+
+        const result = await reconcileMcpForConfig(shared(), projectConfig, action === 'remove' ? { removeAll: true } : {});
+        if (action === 'update') await reconcileMcpForConfig(shared(), projectConfig);
+
+        expect((await fse.readJson(file)).mcpServers['with-secret']).toEqual(mine);
+        if (action === 'update') {
+          expect(result.changes).toContainEqual(expect.objectContaining({ tool: 'copilot', server: 'with-secret', action: 'skipped' }));
+          expect((await fse.readJson(file))['with-secret']).toEqual(doc['with-secret']);
+        }
+        if (action === 'drop' || action === 'remove') expect((await fse.readJson(file))['with-secret']).toBeUndefined();
+      });
+
+      it.each([['update', false], ['remove', false], ['update', true], ['remove', true]] as const)('preserves a keyed member entry with an unmarked bare record during %s, identical=%s', async (action, identical) => {
+        const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+        const manifestFile = managedMcpManifestPath(getDataHome(projectConfig), projectRoot);
+        const manifest = await fse.readJson(manifestFile);
+        delete manifest['copilot:project'][0].bare;
+        await fse.writeJson(manifestFile, manifest);
+        const file = path.join(projectRoot, '.mcp.json');
+        const doc = await fse.readJson(file);
+        const mine = identical ? doc['with-secret'] : { type: 'http', tools: ['*'], url: 'https://member.example/mcp' };
+        await fse.writeJson(file, { ...doc, mcpServers: { 'with-secret': mine } });
+        if (action === 'update') await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'new-team-value')}    tools: [copilot]\n`);
+
+        const result = await reconcileMcpForConfig(shared(), projectConfig, action === 'remove' ? { removeAll: true } : {});
+
+        expect((await fse.readJson(file)).mcpServers['with-secret']).toEqual(mine);
+        expect((await fse.readJson(file))['with-secret']).toEqual(doc['with-secret']);
+        if (action === 'update') expect(result.changes).toContainEqual(expect.objectContaining({ tool: 'copilot', server: 'with-secret', action: 'skipped' }));
+      });
+
+      it.each(['legacy bare', 'legacy keyed', 'proven keyed', 'bare migration'] as const)(
+        'restores %s after a manifest write fails so update and removal can be retried', async (source) => {
+        const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+        const manifestFile = managedMcpManifestPath(getDataHome(projectConfig), projectRoot);
+        const manifest = await fse.readJson(manifestFile);
+        const file = path.join(projectRoot, '.mcp.json');
+        const doc = await fse.readJson(file);
+        if (source.endsWith('keyed')) {
+          await fse.writeJson(file, { mcpServers: doc });
+          manifest['copilot:project'][0].bare = false;
+        }
+        if (source.startsWith('legacy')) delete manifest['copilot:project'][0].bare;
+        if (source === 'bare migration') await fse.writeJson(file, { ...doc, mcpServers: { mine: { command: 'member-server' } } });
+        await fse.writeJson(manifestFile, manifest);
+        const original = await fse.readJson(file);
+        await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'replacement')}    tools: [copilot]\n`);
+        beforeJsonWrite.run = async (target) => {
+          if (target.endsWith('/managed-mcp.json')) throw new Error('simulated manifest write failure');
+        };
+
+        await expect(reconcileMcpForConfig(shared(), projectConfig)).rejects.toThrow('simulated manifest write failure');
+        beforeJsonWrite.run = null;
+
+        expect(await fse.readJson(manifestFile)).toEqual(manifest);
+        expect(await fse.readJson(file)).toEqual(original);
+        expect(git(projectRoot, 'status', '--porcelain', '--untracked-files=all', '--', '.mcp.json')).toBe('');
+        await reconcileMcpForConfig(shared(), projectConfig);
+        expect(await fse.readFile(file, 'utf-8')).not.toContain('super-secret-value');
+        await reconcileMcpForConfig(shared(), projectConfig, { removeAll: true });
+        const removed = await fse.readJson(file);
+        expect(removed['with-secret']).toBeUndefined();
+        expect(removed.mcpServers?.['with-secret']).toBeUndefined();
+        if (source === 'bare migration') expect(removed.mcpServers.mine).toEqual({ command: 'member-server' });
+      });
+
+      it('restores the first write when a second tool fails on the same config', async () => {
+        const { getDataHome, managedMcpManifestPath } = await import('../types.js');
+        const manifestFile = managedMcpManifestPath(getDataHome(projectConfig), projectRoot);
+        const file = path.join(projectRoot, '.mcp.json');
+        const original = await fse.readJson(file);
+        const manifest = await fse.readJson(manifestFile);
+        await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'replacement')}    tools: [copilot]\n${open.replace('servers:\n', '')}`);
+        let writes = 0;
+        beforeJsonWrite.run = async (target) => {
+          if (target === file && ++writes === 2) throw new Error('simulated second config write failure');
+        };
+
+        await expect(reconcileMcpForConfig(shared(), projectConfig)).rejects.toThrow('simulated second config write failure');
+        beforeJsonWrite.run = null;
+
+        expect(await fse.readJson(file)).toEqual(original);
+        expect(await fse.readJson(manifestFile)).toEqual(manifest);
+        await reconcileMcpForConfig(shared(), projectConfig);
+        expect(await fse.readFile(file, 'utf-8')).not.toContain('super-secret-value');
+      });
+
+      it('keeps its line, pull after pull, while Copilot\'s bare entry holds the value beside the mcpServers Claude wrote', async () => {
+        await writeMcpYaml(`${withSecret}    tools: [copilot]\n${open.replace('servers:\n', '')}`);
+        // No longer set: only the entry, not a scan for the value, says what the file holds.
+        vi.stubEnv('SECRET_TOKEN', '');
+
+        await reconcileMcpForConfig(shared(), { ...projectConfig, disabledAgents: ['copilot'] } as LocalConfig);
+        await reconcileMcpForConfig(shared(), { ...projectConfig, disabledAgents: ['copilot'] } as LocalConfig);
+
+        const after = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+        expect(after.mcpServers).toEqual({ open: expect.objectContaining({ url: 'https://example.com/open' }) });
+        expect(JSON.stringify(after)).toContain('super-secret-value');
+        expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+      });
+
+      it('replaces Copilot\'s bare entry when it writes that server again under the mcpServers Claude added', async () => {
+        await writeMcpYaml(`${withSecret}    tools: [copilot]\n${open.replace('servers:\n', '')}`);
+        await reconcileMcpForConfig(shared(), projectConfig);
+        expect((await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>).mcpServers).toBeDefined();
+        await writeMcpYaml(`${withSecret.replace('${SECRET_TOKEN}', 'published-literal')}    tools: [copilot]\n${open.replace('servers:\n', '')}`);
+        vi.stubEnv('SECRET_TOKEN', '');
+
+        await reconcileMcpForConfig(shared(), projectConfig);
+
+        const after = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+        expect(JSON.stringify(after)).not.toContain('super-secret-value');
+        expect(after['with-secret']).toBeUndefined();
+        expect((after.mcpServers as Record<string, unknown>)['with-secret']).toEqual(expect.objectContaining({ headers: { Authorization: 'Bearer published-literal' } }));
+      });
+
+      it('never removes a bare server of the member\'s own that shares a name with one teamai writes under mcpServers', async () => {
+        const mine = { type: 'http', tools: ['*'], url: 'https://jira.example/mcp' };
+        const doc = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+        await fse.writeJson(path.join(projectRoot, '.mcp.json'), { ...doc, jira: mine });
+        const jira = '  - name: jira\n    transport: http\n    url: https://jira.example/mcp\n    tools: [copilot]\n';
+        await writeMcpYaml(`${withSecret}    tools: [copilot]\n${open.replace('servers:\n', '')}${jira}`);
+        await reconcileMcpForConfig(shared(), projectConfig);
+        await reconcileMcpForConfig(shared(), projectConfig);
+        await writeMcpYaml(`${withSecret}    tools: [copilot]\n${open.replace('servers:\n', '')}`);
+        await reconcileMcpForConfig(shared(), projectConfig);
+
+        expect((await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>).jira).toEqual(mine);
+      });
+
+      it('keeps its line while a stale bare copy differs from the entry of that name under mcpServers', async () => {
+        const stale = (await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>)['with-secret'];
+        await fse.writeJson(path.join(projectRoot, '.mcp.json'), {
+          'with-secret': stale,
+          mcpServers: { 'with-secret': { type: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer published-literal' } } },
+        });
+        await fse.writeFile(path.join(projectRoot, '.git', 'info', 'exclude'), '');
+        vi.stubEnv('SECRET_TOKEN', '');
+
+        await reconcileMcpForConfig(shared(), { ...projectConfig, disabledAgents: ['copilot'] } as LocalConfig);
+
+        expect(JSON.stringify(await fse.readJson(path.join(projectRoot, '.mcp.json')))).toContain('super-secret-value');
+        expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+      });
+
+      it('removes Copilot\'s bare entry once the team drops it, leaving the mcpServers Claude wrote', async () => {
+        await writeMcpYaml(open);
+        vi.stubEnv('SECRET_TOKEN', '');
+
+        await reconcileMcpForConfig(shared(), projectConfig);
+
+        const after = await fse.readJson(path.join(projectRoot, '.mcp.json')) as Record<string, unknown>;
+        expect(after).toEqual({ mcpServers: { open: expect.objectContaining({ url: 'https://example.com/open' }) } });
+      });
     });
 
     describe('a config two tools share (Claude and CodeBuddy on .mcp.json)', () => {
@@ -1982,7 +2260,7 @@ servers:
         expect(vi.mocked(log.debug).mock.calls.flat().join('\n')).toMatch(/\/\.mcp\.json/);
       });
 
-      it('but one this pull listed stays when it wrote the value and then failed to record it', async () => {
+      it.each([false, true])('handles a failed ownership write after adding a credential, restoration fails=%s', async (restoreFails) => {
         // Shorter than eight characters: no scan of the file can find it again.
         vi.stubEnv('SECRET_TOKEN', 'short');
         await writeMcpYaml(withSecret);
@@ -1990,10 +2268,23 @@ servers:
           if (path.basename(file) === 'managed-mcp.json') throw new Error('disk full');
         };
 
-        await expect(reconcileMcpForConfig(teamConfig, claudeOnly())).rejects.toThrow('disk full');
+        const rm = fs.promises.rm;
+        const spy = vi.spyOn(fs.promises, 'rm').mockImplementation(async (file, ...args) => {
+          if (restoreFails && String(file) === mcpJson()) throw new Error('simulated restoration failure');
+          return rm(file, ...args);
+        });
+        await expect(reconcileMcpForConfig(teamConfig, claudeOnly())).rejects.toThrow(restoreFails ? /restoring configs failed.*simulated restoration failure/ : 'disk full');
+        spy.mockRestore();
 
-        expect(await fse.readFile(mcpJson(), 'utf-8')).toContain('Bearer short');
-        expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+        if (restoreFails) {
+          expect(await fse.readFile(mcpJson(), 'utf-8')).toContain('Bearer short');
+          expect(await excludeOf(projectRoot)).toMatch(/^\/\.mcp\.json$/m);
+        } else {
+          expect(await fse.pathExists(mcpJson())).toBe(false);
+          expect(await excludeOf(projectRoot)).not.toMatch(/^\/\.mcp\.json$/m);
+          const { readResolvedMcpFiles } = await import('../mcp-resolved-files.js');
+          expect((await readResolvedMcpFiles(claudeOnly())).files[mcpJson()]).toBeUndefined();
+        }
       });
 
       it('but one an earlier pull listed stays while the config cannot be proven clean', async () => {

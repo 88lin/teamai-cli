@@ -39,7 +39,7 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   };
 });
 
-import { MCP_EXCLUDE_END, MCP_EXCLUDE_START, ensureExcludedFromGit, excludeFromGit, removeMcpGitExclude } from '../mcp-git-exclude.js';
+import { MCP_EXCLUDE_END, MCP_EXCLUDE_START, carriesLocalAgentCredential, ensureExcludedFromGit, excludeFromGit, removeMcpGitExclude } from '../mcp-git-exclude.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { log } from '../utils/logger.js';
 
@@ -177,6 +177,14 @@ describe('teamai block in .git/info/exclude (#882)', () => {
         fix: `Run \`git rm --cached ${file}\` (rotate any value a commit of it holds), then \`teamai pull\` again.`,
       });
       expect(await fse.pathExists(excludeFile) ? await fse.readFile(excludeFile, 'utf8') : '').not.toContain('teamai');
+    });
+
+    it('names the caller\'s way to try again in its fix, when given one', async () => {
+      const file = path.join(repo, '.mcp.json');
+
+      expect(await ensureExcludedFromGit(file, { dryRun: true, rerun: 'install the MCP server again' })).toMatchObject({
+        fix: `Run \`git rm --cached ${file}\` (rotate any value a commit of it holds), then install the MCP server again.`,
+      });
     });
 
     it.skipIf(process.getuid?.() === 0).each([
@@ -347,5 +355,29 @@ describe('teamai block in .git/info/exclude (#882)', () => {
       expect(await fse.readFile(excludeFile, 'utf8')).toMatch(/^\/\.mcp\.json$/m);
       expect(await fse.readFile(excludeFile, 'utf8')).not.toContain('/config/');
     });
+  });
+});
+
+describe('a local agent install that carries a credential (#882)', () => {
+  it.each([
+    ['a header', { type: 'http', url: 'https://x.example/mcp', headers: { Authorization: 'Bearer t' } }],
+    ['an env value', { command: 'npx', env: { TOKEN: 't' } }],
+    ['an argument', { command: 'npx', args: ['-y', 'server', '--token', 't'] }],
+    ['a URL with a user', { type: 'http', url: 'https://user:t@x.example/mcp' }],
+    ['a URL with a query', { type: 'http', url: 'https://x.example/mcp?key=t' }],
+    ['a URL with a token in its path', { type: 'http', url: 'https://x.example/mcp/bmcp-t0ken' }],
+    ['any URL: nothing tells a token in its path from a plain one', { type: 'http', url: 'https://x.example/mcp' }],
+    ['a whole command line', { command: 'server --token t' }],
+    ['a whole command line in OpenCode\'s one-element array', { type: 'local', command: ['server --token t'] }],
+    ['a command array with arguments', { type: 'local', command: ['server', '--token', 't'] }],
+  ])('counts %s', (_, entry) => {
+    expect(carriesLocalAgentCredential(entry)).toBe(true);
+  });
+
+  it.each([
+    ['a bare command', { command: 'npx' }],
+    ['a bare command in a one-element array', { type: 'local', command: ['npx'] }],
+  ])('does not count %s', (_, entry) => {
+    expect(carriesLocalAgentCredential(entry)).toBe(false);
   });
 });
