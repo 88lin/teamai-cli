@@ -17,7 +17,7 @@ const mockTakePendingHint = vi.fn().mockResolvedValue(null);
 // Default: no doc has been credited yet this session → every adopted doc is
 // "fresh" (returns its input). Tests that exercise the dedup override this.
 const mockJudgeAdoption = vi.fn().mockResolvedValue([]);
-const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ recalledDocIds: [], adoptedDocIds: [], finalAssistantText: '', recalledDocPaths: {} });
+const mockParseTranscriptForVotes = vi.fn().mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {} });
 // incrementUpvoted now returns the docs it actually credited (or null on lock
 // failure). Default: echo the input docIds as the freshly-credited set.
 const mockIncrementUpvoted = vi.fn().mockImplementation(async (_p: string, docIds: string[]) => docIds);
@@ -132,6 +132,15 @@ vi.mock('../transcript-parser.js', () => ({
   parseTranscriptForVotes: mockParseTranscriptForVotes,
 }));
 
+// votes-sync's adoption comes from the recall-log reducer (#884); its own
+// behavior is covered end to end in recall-attribution.test.ts.
+const mockCreditAdoptedDocs = vi.hoisted(() => vi.fn());
+vi.mock('../recall-adoption.js', () => ({
+  creditAdoptedDocs: mockCreditAdoptedDocs,
+  recalledKeyOf: vi.fn(async () => () => undefined),
+  recordToolCall: vi.fn(async () => undefined),
+}));
+
 const voteMocks = vi.hoisted(() => ({
   hasPendingVoteDeltas: vi.fn().mockResolvedValue(false),
   creditedDocIdsForSession: vi.fn().mockResolvedValue(new Set<string>()),
@@ -168,8 +177,9 @@ const scope: LocalConfig = { repo: { localPath: '/tmp', remote: '' }, username: 
 describe('hook-handlers registry', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], adoptedDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
+    mockParseTranscriptForVotes.mockResolvedValue({ recalledDocIds: [], finalAssistantText: '', recalledDocPaths: {}, recalledDocScopes: {} });
     mockIncrementUpvoted.mockImplementation(async (_p: string, docIds: string[]) => docIds);
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 0 });
     mockJudgeAdoption.mockResolvedValue([]);
     mockPackageManifestHash.mockResolvedValue('before-hash');
     mockTakePendingPackageHint.mockResolvedValue(null);
@@ -186,10 +196,11 @@ describe('hook-handlers registry', () => {
     expect(events).toContain('session-end');
   });
 
-  it('session-end records the final dashboard snapshot and dispatches the webhook, both in the background', () => {
+  it('session-end records the final dashboard snapshot and dispatches the webhook in the background, and syncs votes in the foreground', () => {
     const handlers = buildHandlerRegistry().filter((r) => r.event === 'session-end');
     // Copilot fires SessionEnd (not Stop), so the webhook handler must run here
     // too — otherwise those sessions emit no session-stop notification (#702).
+    // votes-sync credits and pushes the last turn's reads (#884).
     expect(handlers).toEqual([
       expect.objectContaining({
         matcher: '*',
@@ -201,7 +212,14 @@ describe('hook-handlers registry', () => {
         background: true,
         handler: expect.objectContaining({ name: 'webhook-dispatch' }),
       }),
+      expect.objectContaining({
+        matcher: '*',
+        gitOnly: true,
+        requiresConfig: true,
+        handler: expect.objectContaining({ name: 'votes-sync' }),
+      }),
     ]);
+    expect(handlers[2].background).toBeUndefined();
   });
 
   it('session-start has pull and dashboard-report handlers', () => {
@@ -837,15 +855,9 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     // Tool-use adoption → show the summary of what was actually used.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
     expect(result).toContain('Adopted team knowledge this session');
     expect(result).toContain('doc-a');
@@ -860,80 +872,39 @@ describe('hook-handlers registry', () => {
     )!.handler;
 
     // recalled>0 but no adoption evidence → nothing to report, stay silent.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      adoptedDocIds: [],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: [], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-3', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-3', cwd: '/x' }, 'claude', scope);
     expect(result).toBeNull();
   });
 
-  it('votes-sync stays quiet when nothing was recalled', async () => {
+  it('votes-sync stays quiet when the votes file was busy', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: [],
-      adoptedDocIds: [],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: null, recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-4', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-4', cwd: '/x' }, 'claude', scope);
     expect(result).toBeNull();
   });
 
   // ── upvote from tool-use adoption only ──
 
-  it('votes-sync: tool-use adoption upvotes recalled docs with NO self-declaration (issue #723)', async () => {
+  it('votes-sync credits the dispatch session\'s adoption from the recall log, with no transcript (#884)', async () => {
     const registry = buildHandlerRegistry();
     const handler = registry.find(
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    // The agent opened one recalled doc's file (adoptedDocIds) → it is upvoted,
-    // with zero cooperation from the model.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 2 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-adopt-1', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-adopt-1', cwd: '/x' }, 'claude', scope);
 
-    // Only the adopted doc is upvoted, not every recalled candidate.
-    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-a'], expect.any(String));
-    // The handler surfaces a user-facing adopted-knowledge summary.
+    expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-adopt-1');
+    expect(mockParseTranscriptForVotes).not.toHaveBeenCalled();
     expect(result).toContain('Adopted team knowledge this session');
-  });
-
-  it('votes-sync: incrementUpvoted is not called when nothing was adopted', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'],
-      adoptedDocIds: [],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-2', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
   });
 
   it('votes-sync skips updateReports when there are no pending vote deltas', async () => {
@@ -974,7 +945,7 @@ describe('hook-handlers registry', () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     // Recalled two docs; neither opened → both go to the judge.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'I applied doc-a here.',
       recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
@@ -1002,12 +973,13 @@ describe('hook-handlers registry', () => {
 
   it('votes-judge does NOT re-judge docs already credited by tool-use', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
-    // doc-a already adopted via tool-use → only doc-b is uncredited.
+    // doc-a already upvoted via tool-use (in the session ledger) → only doc-b is uncredited.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: ['doc-a'],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'used something', recalledDocPaths: { 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
     });
+    voteMocks.creditedDocIdsForSession.mockResolvedValueOnce(new Set(['doc-a']));
     mockJudgeAdoption.mockResolvedValue([]);
 
     const registry = buildHandlerRegistry();
@@ -1072,7 +1044,7 @@ describe('hook-handlers registry', () => {
     async function judgeRoots(config: LocalConfig): Promise<string[]> {
       process.env.TEAMAI_UPVOTE_JUDGE = '1';
       mockParseTranscriptForVotes.mockResolvedValue({
-        recalledDocIds: ['doc-a'], adoptedDocIds: [], finalAssistantText: 'used doc-a',
+        recalledDocIds: ['doc-a'], finalAssistantText: 'used doc-a',
         recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
       });
       const registry = buildHandlerRegistry();
@@ -1123,7 +1095,7 @@ describe('hook-handlers registry', () => {
     // is no per-session marker, so doc-a is re-sent to the judge along with
     // doc-b. Only the adopted doc lands in the ledger.
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a', 'doc-b'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a', 'doc-b'],
       finalAssistantText: 'final reply using doc-b', recalledDocPaths: { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
       recalledDocScopes: {},
     });
@@ -1144,7 +1116,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge with an empty verdict upvotes nothing (ledger-only: no marker, no crash residue)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a'],
       finalAssistantText: 'x', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
     });
     // Judge returns no adoption (e.g. CLI missing → soft-fails to []) — nothing
@@ -1167,7 +1139,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge SKIPS a doc already in the session upvote ledger (no CLI call, keeps cost bounded)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'], adoptedDocIds: [],
+      recalledDocIds: ['doc-a'],
       finalAssistantText: 'used doc-a', recalledDocPaths: { 'doc-a': '/l/doc-a.md' }, recalledDocScopes: {},
     });
     // The foreground pass already upvoted doc-a this session (in the shared ledger).
@@ -1187,7 +1159,7 @@ describe('hook-handlers registry', () => {
   it('votes-judge does NOT upvote an inherited USER-scope doc while a PROJECT is active (#2)', async () => {
     process.env.TEAMAI_UPVOTE_JUDGE = '1';
     mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['proj-doc', 'user-doc'], adoptedDocIds: [],
+      recalledDocIds: ['proj-doc', 'user-doc'],
       finalAssistantText: 'used both', recalledDocPaths: { 'proj-doc': '/l/proj-doc.md', 'user-doc': '/l/user-doc.md' },
       recalledDocScopes: { 'proj-doc': 'project', 'user-doc': 'user' },
     });
@@ -1231,45 +1203,6 @@ describe('hook-handlers registry', () => {
     expect(mockSyncVotesToTeam).toHaveBeenCalledWith('/wt', 'test', expect.any(String));
   });
 
-  it('votes-sync: incrementUpvoted upvotes all adopted ids', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-p', 'doc-q'],
-      adoptedDocIds: ['doc-p', 'doc-q'],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-3', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).toHaveBeenCalledOnce();
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-p', 'doc-q'], expect.any(String));
-  });
-
-  it('votes-sync: incrementUpvoted is not called when recalledDocIds is empty', async () => {
-    const registry = buildHandlerRegistry();
-    const handler = registry.find(
-      (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
-    )!.handler;
-
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: [],
-      adoptedDocIds: [],
-    });
-
-    await handler.execute(
-      { session_id: 'sid-filter-empty-recalled', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
-
-    expect(mockIncrementUpvoted).not.toHaveBeenCalled();
-  });
-
   // ── votes-sync adopted-summary is skipped for stdout-less tools ──
 
   it.each(['codebuddy', 'codex'])('votes-sync stays silent (no summary) for %s whose Stop stdout is ignored', async (tool) => {
@@ -1280,18 +1213,12 @@ describe('hook-handlers registry', () => {
 
     // Adoption happened, but the summary is a user-facing note we do not route
     // through the model context of stdout-less tools.
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-b'],
-      adoptedDocIds: ['doc-b'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-b'], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-votes-stash', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      tool, scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-votes-stash', cwd: '/x' }, tool, scope);
     expect(result).toBeNull();
     // The upvote is still recorded.
-    expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-b'], expect.any(String));
+    expect(mockCreditAdoptedDocs).toHaveBeenCalledWith(scope, 'sid-votes-stash');
   });
 
   it('votes-sync returns the adopted summary via stdout for claude', async () => {
@@ -1300,24 +1227,15 @@ describe('hook-handlers registry', () => {
       (r) => r.event === 'stop' && r.handler.name === 'votes-sync',
     )!.handler;
 
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-c'],
-      adoptedDocIds: ['doc-c'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-c'], recalled: 1 });
 
-    const result = await handler.execute(
-      { session_id: 'sid-votes-stdout', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
-      'claude', scope,
-    );
+    const result = await handler.execute({ session_id: 'sid-votes-stdout', cwd: '/x' }, 'claude', scope);
     expect(result).not.toBeNull();
     expect(result).toContain('doc-c');
   });
 
   it('stop dispatcher merges the adopted summary and the contribute hint', async () => {
-    mockParseTranscriptForVotes.mockResolvedValue({
-      recalledDocIds: ['doc-a'],
-      adoptedDocIds: ['doc-a'],
-    });
+    mockCreditAdoptedDocs.mockResolvedValue({ credited: ['doc-a'], recalled: 1 });
     mockContributeCheckForSession.mockResolvedValueOnce({ hint: 'CONTRIBUTE-HINT' });
     const dispatcher = createDispatcher({ handlers: buildHandlerRegistry(), localConfig: scope });
 

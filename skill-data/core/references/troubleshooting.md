@@ -141,7 +141,7 @@ broken machine):
 | Claude Code (`claude`)| Installed                 | Fully supported — this is the main, working path                    |
 | Codex                 | Written but **trust-gated** or skipped | Codex gates non-managed hooks behind an explicit trust step; `teamai doctor` prints a reminder to trust them |
 | Cursor                | Often not written         | Uses its own hook mechanism; broader CLI support is still pending   |
-| CodeBuddy / WorkBuddy | Skipped **by design**     | They only accept versioned plugins (`plugin@version`); teamai writes raw entries into a `hooks` field, which they don't take |
+| CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`                    |
 
 Practical rule: if you set up with `--agent claude`, expect **only** Claude to show
 hooks installed. A tool you are not using, or one that is not a supported hook
@@ -190,6 +190,27 @@ sync with a manual `teamai pull`.
 Gemini CLI, JoyCode, and similar tools have no TeamAI-writable hook surface —
 there is no auto-sync. Tell the user to run `teamai pull` manually at the start of
 each session.
+
+## "A recalled doc got no upvote"
+
+A recalled doc is upvoted once per session when the session that ran the recall
+opens it within 24 hours: a file read, a reader command (`cat`, `sed -n`, …), or
+a search whose output shows its lines. Listing the doc does not count, and
+neither does working from the recall subagent's summary alone; only the opt-in
+judge (`TEAMAI_UPVOTE_JUDGE=1`) credits that. `teamai stats` shows each recent
+session's runs, recalled docs and adopted docs. Per agent:
+
+- **Claude Code, Codex (0.134+), CodeBuddy (2.103.1+), WorkBuddy, Qoder,
+  OpenCode**: both a recall the main agent runs and one the `teamai-recall`
+  subagent runs are credited when the main agent opens the doc.
+- **Cursor, Copilot CLI, ZCode, OMP, Pi**: only a recall the main agent runs
+  itself. A subagent's recall is not linked to the main session, and Pi has no
+  TeamAI subagent.
+- **OpenClaw, Hermes, Kiro, JoyCode**: no PostToolUse hook, so recalls never
+  vote.
+
+A read after the session's last Stop is credited at SubagentStop, at Copilot CLI's
+SessionEnd, or at the next `teamai pull`.
 
 ## Still stuck
 
