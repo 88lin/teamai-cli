@@ -72,7 +72,12 @@ export function resolveOmpExtensionsDir(): string {
  *     session), and a subagent's events its `agent_id` / `agent_type` from
  *     `ctx.agent`, which only OMP >= 18.3.2 has: it is read only when present.
  *     `tool_result` also carries the tool's text output and a status from
- *     `isError`.
+ *     `isError`. A subagent's session file is `<parent>/<agent id>.jsonl`
+ *     beside its parent's `<parent>.jsonl`, whose session header (after the
+ *     title slot line) names the parent session, so a subagent's
+ *     `tool_result` links its session to the parent's, once the parent's file
+ *     is on disk; OMP has no API for it. A main session without a session
+ *     file (`--no-session`) gives no link.
  *   - Tool naming: OMP passes lowercase tool ids (`bash`, `read`, …) and has
  *     no `Skill` / `TodoWrite` tool to map onto Claude's PascalCase matcher
  *     names, so there is no matcher-scoped pass — only the wildcard
@@ -95,6 +100,8 @@ export function buildOmpExtensionSource(): string {
 // would force a session continuation.
 
 import { $ } from "bun";
+import fs from "node:fs";
+import path from "node:path";
 
 /**
  * The session this handler serves (a subagent's own), and for a subagent its
@@ -113,6 +120,35 @@ const sessionOf = (ctx) => {
     if (typeof agent.name === "string" && agent.name) fields.agent_type = agent.name;
   }
   return fields;
+};
+
+/** How much of a session file is read for its header lines. */
+const HEADER_READ_BYTES = 65536;
+
+/**
+ * The session a subagent's session was started from: its file is
+ * <parent>/<agent id>.jsonl, and <parent>.jsonl opens with OMP's title slot
+ * line, then the parent's session header. Undefined for any other session,
+ * and while the parent's file is not on disk.
+ */
+const parentSessionOf = (ctx) => {
+  try {
+    const file = ctx.sessionManager && ctx.sessionManager.getSessionFile && ctx.sessionManager.getSessionFile();
+    if (typeof file !== "string" || !file) return undefined;
+    const fd = fs.openSync(\`\${path.dirname(file)}.jsonl\`, "r");
+    try {
+      const head = Buffer.alloc(HEADER_READ_BYTES);
+      const size = fs.readSync(fd, head, 0, head.length, 0);
+      const [first, second] = head.toString("utf8", 0, size).split("\\n", 2);
+      let header = JSON.parse(first);
+      if (header && header.type === "title") header = JSON.parse(second);
+      return header && header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
 };
 
 /** A tool result's text parts, joined; undefined when it has no content list. */
@@ -153,15 +189,25 @@ export default function teamaiHooks(pi) {
     await dispatch("prompt-submit", ctx, { prompt: event.prompt });
   });
 
+  // Subagent sessions already linked: a session's parent never changes.
+  const linked = new Set();
+
   // content is what the model saw; isError is set for a failed call,
   // including a bash command that exits non-zero.
   pi.on("tool_result", async (event, ctx) => {
-    await dispatch("post-tool-use", ctx, {
+    const payload = {
       tool_name: event.toolName,
       tool_input: event.input,
       tool_response: textOf(event.content),
       tool_status: event.isError === true ? "failure" : event.isError === false ? "success" : "unknown",
-    });
+    };
+    const child = sessionOf(ctx).session_id;
+    const parent = child && !linked.has(child) ? parentSessionOf(ctx) : undefined;
+    if (parent) {
+      payload.session_link = { child, parent };
+      linked.add(child);
+    }
+    await dispatch("post-tool-use", ctx, payload);
   });
 }
 `;

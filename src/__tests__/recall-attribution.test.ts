@@ -531,6 +531,31 @@ class Harness {
 
   private piExt?: ReturnType<typeof loadPiExtension>;
   private ompExt?: ReturnType<typeof loadOmpExtension>;
+  /** The session file OMP's session manager reports for each session, when one is written. */
+  private readonly ompSessionFiles: Record<string, string> = {};
+
+  /**
+   * Write OMP's session files as OMP lays them out: `parent` at
+   * `<ts>_<id>.jsonl`, headed by its padded title slot and then its session
+   * header, and the subagent `agent` ran in session `child` at
+   * `<ts>_<id>/<agent id>.jsonl`. With `parentHeader: false` the parent's file
+   * is not on disk yet; the returned function writes it.
+   */
+  ompSessions(parent: string, child: string, agent: OmpAgent, options: { parentHeader?: boolean } = {}): () => void {
+    const parentFile = path.join(this.tmp, 'omp-sessions', `2026-09-01T09-00-00-000Z_${parent}.jsonl`);
+    const artifactsDir = parentFile.slice(0, -'.jsonl'.length);
+    fs.mkdirSync(artifactsDir, { recursive: true });
+    const timestamp = new Date(T0).toISOString();
+    const header = (id: string) => JSON.stringify({ type: 'title', v: 1, title: '', updatedAt: timestamp, pad: ' '.repeat(128) }) + '\n'
+      + JSON.stringify({ type: 'session', version: 3, id, timestamp, cwd: this.root }) + '\n';
+    const writeParent = () => fs.writeFileSync(parentFile, header(parent));
+    if (options.parentHeader !== false) writeParent();
+    const childFile = path.join(artifactsDir, `${agent.id}.jsonl`);
+    fs.writeFileSync(childFile, header(child));
+    this.ompSessionFiles[parent] = parentFile;
+    this.ompSessionFiles[child] = childFile;
+    return writeParent;
+  }
 
   /**
    * The host fires `event` at the generated Pi or OMP extension (evaluated in
@@ -540,7 +565,9 @@ class Harness {
    */
   async bridge(tool: 'pi' | 'omp', event: string, payload: Record<string, unknown>, session: string, agent?: OmpAgent): Promise<void> {
     const ext = tool === 'pi' ? (this.piExt ??= loadPiExtension()) : (this.ompExt ??= loadOmpExtension());
-    await ext.on[event](payload, { cwd: this.root, sessionManager: { getSessionId: () => session }, ...(agent ? { agent } : {}) });
+    const file = tool === 'omp' ? this.ompSessionFiles[session] : undefined;
+    const sessionManager = { getSessionId: () => session, ...(file ? { getSessionFile: () => file } : {}) };
+    await ext.on[event](payload, { cwd: this.root, sessionManager, ...(agent ? { agent } : {}) });
     for (const { args: argv, payload: stdin } of ext.dispatches.splice(0)) {
       await this.dispatch(argv[1], { session_id: undefined, ...stdin }, null, tool);
     }
@@ -1795,6 +1822,52 @@ const ROWS: Row[] = [
       await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
       await h.bridge('omp', 'session_stop', {}, OMP);
+    },
+    project: {},
+  },
+  {
+    name: '10: OMP recall subagent recalls and reads, then the main agent reads; the subagent\'s session file sits under its parent\'s → +1',
+    trace: async (h) => {
+      h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT);
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
+      await h.ompTool(OMP, 'read', { path: files[0] }, '---', OMP_MAIN_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
+    },
+    project: { 'redis-timeout': 1 },
+  },
+  {
+    name: '10: OMP recall subagent linked to its parent reads the doc, and the main agent does not → 0',
+    trace: async (h) => {
+      h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT);
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
+    },
+    project: {},
+  },
+  {
+    name: '10: OMP parent session file not on disk at the subagent\'s first call, written before its read; then the main agent reads → +1',
+    trace: async (h) => {
+      const writeParent = h.ompSessions(OMP, OMP_SUB, OMP_RECALL_AGENT, { parentHeader: false });
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      writeParent();
+      await h.ompTool(OMP_SUB, 'read', { path: files[0] }, '---', OMP_RECALL_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
+      await h.ompTool(OMP, 'read', { path: files[0] }, '---', OMP_MAIN_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
+    },
+    project: { 'redis-timeout': 1 },
+  },
+  {
+    name: '10: OMP recall subagent whose main session has no session file (--no-session: no parent to find), then the main agent reads → 0',
+    trace: async (h) => {
+      const { files } = await h.ompRecall('redis timeout', OMP_SUB, { caller: 'teamai-recall', agent: OMP_RECALL_AGENT });
+      await h.bridge('omp', 'session_stop', {}, OMP_SUB, OMP_RECALL_AGENT);
+      await h.ompTool(OMP, 'read', { path: files[0] }, '---', OMP_MAIN_AGENT);
+      await h.bridge('omp', 'session_stop', {}, OMP, OMP_MAIN_AGENT);
     },
     project: {},
   },
