@@ -715,6 +715,38 @@ const secretsHintHandler: HookHandler = {
   },
 };
 
+/**
+ * SessionStart: a project's rules and instruction blocks (culture, shared
+ * instructions, recall) for a tool with no rules format and no project file of
+ * its own (the Codex family, #938, #945). The project AGENTS.md is the
+ * owners' file, and other tools read it too. User-scope content is in the
+ * tool's own AGENTS.md, so a session outside a project gets nothing here.
+ * Codex runs SessionStart again after a compaction or a clear; a resumed
+ * session already holds the content in its history. A subagent fires
+ * SubagentStart instead, which gets the same content.
+ */
+const teamRulesHandler: HookHandler = {
+  name: 'team-rules',
+  async execute(stdin, tool, config) {
+    if (!config || config.scope !== 'project' || stdin.source === 'resume') return null;
+    const { getsRulesFromSessionHook } = await import('./resources/rule-format.js');
+    const { isAgentExcluded } = await import('./types.js');
+    if (!getsRulesFromSessionHook(tool) || isAgentExcluded(config, tool)) return null;
+    const { loadTeamConfig } = await import('./config.js');
+    const teamConfig = await loadTeamConfig(config.repo.localPath);
+    if (!teamConfig) return null;
+    const { sessionInstructionBlocks } = await import('./pull.js');
+    const { teamRulesContext } = await import('./resources/rules.js');
+    const parts = await sessionInstructionBlocks(teamConfig, config, tool);
+    const rules = await teamRulesContext(teamConfig, config);
+    if (rules !== null) parts.push(rules);
+    if (parts.length === 0) return null;
+    // Codex rejects output whose hookEventName is not the event it ran.
+    const hookEventName = stdin.hook_event_name === 'SubagentStart' ? 'SubagentStart' : 'SessionStart';
+    return JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: parts.join('\n\n') } });
+  },
+};
+
 /** HTTP local-agent report/sync + workspace binding prompts. */
 const localAgentHandler: HookHandler = {
   name: 'local-agent-sync',
@@ -826,6 +858,7 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
     // (PULL_TIMEOUT_MS) — the shared 15s truncated the pull itself.
     { event: 'session-start', matcher: '*', handler: pullHandler, timeoutMs: PULL_TIMEOUT_MS, background: true },
     { event: 'session-start', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
+    { event: 'session-start', matcher: '*', handler: teamRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: mrHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, gitOnly: true, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: packageHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
     { event: 'session-start', matcher: '*', handler: secretsHintHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
@@ -858,6 +891,10 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
     { event: 'stop', matcher: '*', handler: dashboardReportHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
     { event: 'stop', matcher: '*', handler: localAgentHandler, timeoutMs: LOCAL_AGENT_TIMEOUT_MS, background: true },
     { event: 'stop', matcher: '*', handler: webhookHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, background: true, requiresConfig: true },
+
+    // ─── SubagentStart ────────────────────────────────
+    // Codex only (SUBAGENT_START_SPEC): a fresh subagent fires no SessionStart (#938).
+    { event: 'subagent-start', matcher: '*', handler: teamRulesHandler, timeoutMs: FOREGROUND_HOOK_TIMEOUT_MS, requiresConfig: true },
 
     // ─── SubagentStop ─────────────────────────────────
     // A subagent can finish after the session's last Stop (a background

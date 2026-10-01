@@ -1,29 +1,35 @@
 import path from 'node:path';
 import { isToolInstalledForConfig, ResourceHandler } from './base.js';
 import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
-import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, listDirs, readFileSafe, writeFile } from '../utils/fs.js';
+import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, listDirs, readFileSafe, writeFile, pruneEmptyDirs, fileHash } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
-import { TEAMAI_RULES_START, TEAMAI_RULES_END, resolveBaseDir, resolveToolBaseDir, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
-import { EXCLUDED_RULE_NAMES } from '../builtin-rules.js';
+import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveBaseDir, resolveToolBaseDir, isAgentExcluded, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
+import { EXCLUDED_RULE_NAMES, isDeployedRecallRule } from '../builtin-rules.js';
 import { teamRuleToCursorMdc, mergeCursorBodyIntoTeamMd, cursorMdcBodyEqualsTeamMd } from './cursor-mdc.js';
 import {
   copilotInstructionsBodyEqualsTeamMd,
   mergeCopilotBodyIntoTeamMd,
   teamRuleToCopilotInstructions,
 } from './copilot-instructions.js';
+import { splitFrontmatter } from '../utils/frontmatter.js';
 import { assertWithinRoot } from '../utils/path-safety.js';
 import { loadStateForScope } from '../config.js';
 import { placedResourcePath } from '../push-namespaces.js';
 import { deliversEveryNamespace } from '../resource-namespaces.js';
 import { getFileContentAtRev, isPastVersionOf } from '../utils/git.js';
-import { forgetDelivered, keepsEditedCopy, recordDelivered, removedCopyChanged, type DeliveryLedger } from './delivered-copies.js';
+import { forgetDelivered, keepsEditedCopy, recordDelivered, removedCopyChanged, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
 import {
   ruleFileExtensionForTool,
   ruleStemFromFilename,
   usesCursorMdcRules,
   usesCopilotInstructions,
   isLegacyCursorRuleFile,
+  LEGACY_RULE_DIRS,
+  rulePaths,
+  writesInstructionBlock,
+  instructionFileInstallProbe,
 } from './rule-format.js';
+import { injectClaudeMdSection, removeClaudeMdSection } from '../utils/claudemd.js';
 
 export class RulesHandler extends ResourceHandler {
   readonly type = 'rules' as const;
@@ -414,8 +420,11 @@ export class RulesHandler extends ResourceHandler {
       }
     }
 
-    // Refresh CLAUDE.md references
-    await this.pullAllRules(teamConfig, localConfig);
+    // Refresh with the rules this member's pull delivers, so the role, project
+    // and tag selection still applies to the files the refresh writes.
+    const { buildRolePullContext, resolveDesiredRules } = await import('./desired.js');
+    const { items, replaced } = await resolveDesiredRules(teamConfig, localConfig, await buildRolePullContext(localConfig));
+    await this.pullAllRules(teamConfig, localConfig, items, replaced);
 
     return removed;
   }
@@ -446,9 +455,11 @@ export class RulesHandler extends ResourceHandler {
       const { getHermesHome } = await import('../hermes-home.js');
       if (await pathExists(getHermesHome())) {
         const { upsertSoulRules } = await import('../hermes-config.js');
-        await upsertSoulRules(await hermesRulesText(rules));
+        await upsertSoulRules(await inlinedRulesText(rules));
       }
     }
+
+    await this.syncCodexInstructionRules(teamConfig, localConfig, rules, ledger);
 
     // OpenCode does not auto-scan a rules directory: the .md files are inert
     // until referenced from `instructions` in opencode.json. Activate (or, when
@@ -587,24 +598,142 @@ export class RulesHandler extends ResourceHandler {
       const baseDir = resolveToolBaseDir(tool, localConfig);
       const claudeMdPath = path.join(baseDir, toolPath.claudemd);
       try {
-        const content = await readFileSafe(claudeMdPath);
-        if (!content || !content.includes(TEAMAI_RULES_START)) continue;
-        const startIdx = content.indexOf(TEAMAI_RULES_START);
-        const endIdx = content.indexOf(TEAMAI_RULES_END);
-        if (startIdx === -1 || endIdx === -1) continue;
-        const before = content.substring(0, startIdx).replace(/\n+$/, '\n');
-        const after = content.substring(endIdx + TEAMAI_RULES_END.length).replace(/^\n+/, '\n');
-        const newContent = (before + after).trim();
-        if (newContent.length === 0) {
-          await remove(claudeMdPath);
-        } else {
-          await writeFile(claudeMdPath, newContent + '\n');
+        if (await removeClaudeMdSection(claudeMdPath, TEAMAI_RULES_START, TEAMAI_RULES_END, { deleteIfEmpty: true })) {
+          log.debug(`Removed legacy rules section from ${claudeMdPath}`);
         }
-        log.debug(`Removed legacy rules section from ${claudeMdPath}`);
       } catch {
         // Best-effort cleanup
       }
     }
+  }
+
+  /**
+   * The Codex family's part of a rules sync: the team rules go into its
+   * user-scope AGENTS.md, which only it reads; in a project its session-start
+   * hook adds them (#938). The copies earlier pulls left in its rules
+   * directory are reclaimed. Public so the "Already synced" pull can run it
+   * after a CLI upgrade.
+   */
+  async syncCodexInstructionRules(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    rules: ResourceItem[],
+    ledger?: DeliveryLedger,
+  ): Promise<void> {
+    const block = await teamRulesBlock(rules);
+    for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
+      if (!writesInstructionBlock(tool, toolPath, 'team-rules')) continue;
+      const file = path.join(resolveToolBaseDir(tool, localConfig), toolPath.claudemd);
+      const probe = instructionFileInstallProbe(tool, toolPath);
+      const active = !isAgentExcluded(localConfig, tool)
+        && (probe === undefined || await isToolInstalledForConfig(tool, probe, localConfig));
+      try {
+        if (active && block !== null) {
+          await injectClaudeMdSection(file, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, block);
+        } else {
+          // A file teamai created for the block alone goes with it.
+          await removeClaudeMdSection(file, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, { deleteIfEmpty: true });
+        }
+      } catch (e) {
+        log.warn(`Failed to update team rules in ${file}: ${(e as Error).message}`);
+      }
+    }
+    await this.reclaimLegacyRuleCopies(teamConfig, localConfig, ledger);
+  }
+
+  /**
+   * Remove the `<rule>.md` copies earlier pulls wrote to a rules directory the
+   * tool never read (`LEGACY_RULE_DIRS`) that are still teamai's
+   * (`legacyRuleCopies`). The copies kept are named in one warning per rules
+   * sync, until the member deletes them. Public so the "Already synced" pull
+   * can run it after a CLI upgrade without a full sync (#938).
+   */
+  async reclaimLegacyRuleCopies(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    ledger: DeliveryLedger | undefined,
+  ): Promise<void> {
+    const kept: string[] = [];
+    for (const { tool, dir, owned, edited } of await this.legacyRuleCopies(teamConfig, localConfig, ledger?.previous)) {
+      for (const file of owned) {
+        await remove(file);
+        if (ledger) forgetDelivered(ledger.hashes, file);
+        log.debug(`Removed ${file}: ${tool} gets the team rules from its session-start hook`);
+      }
+      kept.push(...edited);
+      // Codex's own `*.rules` keep the directory; only an emptied one goes.
+      if (owned.length > 0) await pruneEmptyDirs(dir);
+    }
+    if (kept.length > 0) {
+      log.warn(
+        `Kept ${kept.join(', ')}: teamai could not verify that ${kept.length === 1 ? 'it matches' : 'they match'} what it delivered there, `
+        + 'and Codex does not read .md files in its rules directory (team rules now reach it through its session-start hook). '
+        + 'Delete what you did not edit; to keep your changes, move them into AGENTS.md outside the teamai markers, '
+        + 'then delete the copy.',
+      );
+    }
+  }
+
+  /**
+   * The `<rule>.md` copies earlier pulls wrote to each rules directory a tool
+   * never read (`LEGACY_RULE_DIRS`), split into the ones still teamai's and the
+   * ones the member edited. A copy is teamai's while it holds what teamai
+   * delivered there: the team rule verbatim, now or at a revision this
+   * checkout pulled, or as `previous` (the delivery ledger) recorded it; the
+   * built-in `teamai-recall.md` as any teamai version deployed it. Every team
+   * rule counts, not just the ones delivered here, since a copy outlives the
+   * role or tag that selected it. A copy of a rule the team removed is teamai's
+   * only while it matches its recorded delivery hash. Without that record,
+   * the copy stays because it may contain the member's edits. A directory a team
+   * `toolPaths` still delivers rules to is not listed.
+   *
+   * Read-only and public so `uninstall` removes exactly what a pull reclaims.
+   */
+  async legacyRuleCopies(
+    teamConfig: TeamaiConfig,
+    localConfig: LocalConfig,
+    previous: DeliveredHashes | undefined,
+  ): Promise<Array<{ tool: string; dir: string; owned: string[]; edited: string[] }>> {
+    const teamRules = await this.scanTeamForPull(teamConfig, localConfig);
+    const tombstoned = [...await this.readTombstones(localConfig)]
+      .filter((name) => !teamRules.some((rule) => rule.name === name));
+    let deliveredRevs: readonly string[] | undefined;
+    const out: Array<{ tool: string; dir: string; owned: string[]; edited: string[] }> = [];
+    // A team `toolPaths` that still names one of these dirs delivers there.
+    const deliveredDirs = new Set(
+      Object.entries(scopedToolPaths(teamConfig, localConfig))
+        .filter(([, toolPath]) => toolPath.rules)
+        .map(([tool, toolPath]) => path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules!)),
+    );
+    for (const [tool, rel] of Object.entries(LEGACY_RULE_DIRS)) {
+      const dir = path.join(resolveToolBaseDir(tool, localConfig), rel);
+      if (deliveredDirs.has(dir) || !await pathExists(dir)) continue;
+      const owned: string[] = [];
+      const edited: string[] = [];
+      for (const rule of teamRules) {
+        const file = path.join(dir, `${rule.name}.md`);
+        if (!await pathExists(file)) continue;
+        deliveredRevs ??= (
+          await (await import('../pull.js')).resolveCheckoutBases(localConfig, await loadStateForScope(localConfig))
+        ).revs;
+        const recorded = previous?.[file];
+        const delivered = (recorded !== undefined && recorded === await fileHash(file))
+          || await isDeliveredRender(tool, file, rule, localConfig.repo.localPath, deliveredRevs);
+        (delivered ? owned : edited).push(file);
+      }
+      // The source is gone, so only a recorded hash proves a copy is unchanged.
+      for (const name of tombstoned) {
+        const file = path.join(dir, `${name}.md`);
+        if (!await pathExists(file)) continue;
+        const recorded = previous?.[file];
+        (recorded !== undefined && recorded === await fileHash(file) ? owned : edited).push(file);
+      }
+      const recall = path.join(dir, 'teamai-recall.md');
+      const recallContent = await readFileSafe(recall);
+      if (recallContent !== null) (isDeployedRecallRule(recallContent) ? owned : edited).push(recall);
+      out.push({ tool, dir, owned, edited });
+    }
+    return out;
   }
 
   /**
@@ -756,18 +885,64 @@ async function isDeliveredRender(
 }
 
 /**
- * The text `upsertSoulRules` inlines into the teamai block of Hermes SOUL.md.
+ * The team rules as one text, for a tool with no rules directory: Hermes,
+ * whose SOUL.md block pull writes and `doctor` compares, and the Codex
+ * family, whose session-start hook adds it (`teamRulesContext`).
  *
- * Hermes reads standing instructions from one file rather than a rules
- * directory, so its rules are delivered as this block's contents. `doctor`
- * compares what is in the block with this, the same way it compares a rule
- * file with its render.
+ * Frontmatter is dropped. Neither can scope a rule to paths, so a path-scoped
+ * rule is always on, led by a line naming its globs.
  */
-export async function hermesRulesText(rules: ResourceItem[]): Promise<string> {
+export async function inlinedRulesText(rules: ResourceItem[]): Promise<string> {
   const bodies: string[] = [];
   for (const rule of rules) {
-    const body = await readFileSafe(rule.sourcePath);
-    if (body && body.trim() !== '') bodies.push(body.trim());
+    const content = await readFileSafe(rule.sourcePath);
+    if (!content) continue;
+    const { data, body } = splitFrontmatter(content);
+    if (body.trim() === '') continue;
+    const paths = rulePaths(data);
+    const scope = paths.length > 0 ? `Applies to files matching: ${paths.join(', ')}\n` : '';
+    bodies.push(`${scope}${body.trim()}`);
   }
   return bodies.join('\n\n');
+}
+
+/**
+ * The team-rules block for a tool's user-scope instructions file (the Codex
+ * family, #938), markers included. Null when no rule has a body. The body is
+ * the same render Hermes gets in SOUL.md.
+ */
+export async function teamRulesBlock(rules: ResourceItem[]): Promise<string | null> {
+  // A marker anywhere in a rule body would cut the block short on the next
+  // read, which finds the markers by substring. A line that held only one goes.
+  const body = (await inlinedRulesText(rules))
+    .split('\n')
+    .flatMap((line) => {
+      const cleaned = line.replaceAll(TEAMAI_TEAM_RULES_START, '').replaceAll(TEAMAI_TEAM_RULES_END, '');
+      return cleaned !== line && cleaned.trim() === '' ? [] : [cleaned];
+    })
+    .join('\n')
+    .trim();
+  if (body === '') return null;
+  return [
+    TEAMAI_TEAM_RULES_START,
+    '<!-- DO NOT EDIT: This section is auto-managed by teamai -->',
+    '',
+    body,
+    '',
+    TEAMAI_TEAM_RULES_END,
+  ].join('\n');
+}
+
+/**
+ * The team rules a tool with no rules format gets from its session-start hook
+ * in a project (the Codex family, #938): the rules this member receives there,
+ * as pull resolves them, in the same render as Hermes' SOUL.md. Null when no
+ * rule has a body. User-scope rules reach it through its own instructions
+ * file instead.
+ */
+export async function teamRulesContext(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string | null> {
+  const { buildRolePullContext, resolveDesiredRules } = await import('./desired.js');
+  const { items } = await resolveDesiredRules(teamConfig, localConfig, await buildRolePullContext(localConfig));
+  const text = await inlinedRulesText(items);
+  return text === '' ? null : `Team rules (from teamai):\n\n${text}`;
 }

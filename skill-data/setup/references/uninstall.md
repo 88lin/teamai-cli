@@ -14,7 +14,11 @@ machine** (all tools)?"*
 
 - **Just this tool** → `--agent <tool>` (use the tool this conversation runs in,
   e.g. `claude`). Shared resources are removed only if it is the last tool using
-  them.
+  them. An instructions file several tools read (the project `AGENTS.md` of Pi,
+  Hermes and WorkBuddy) is cleaned block by block: a teamai block stays while
+  a remaining tool on that file still writes it, so `--agent workbuddy` with Pi
+  still enabled removes the recall block and keeps the rest. A file teamai
+  created goes with its last block; one the user had before stays, even if empty.
 - **Whole machine** → no `--agent` flag.
 
 Reassure them (in their language): *"This only removes things from your computer.
@@ -51,6 +55,10 @@ and give it your team repo URL."*
 
 ## Notes
 
+- Uninstall keeps edited legacy Codex rule copies. For a rule the team has
+  removed, it deletes the copy only if its hash matches the recorded delivery.
+  Without that record, it keeps the copy and names it in a warning. Save any
+  changes you need, then delete the copy manually.
 - Do **not** delete the team repo on the Git platform — uninstall never touches it,
   and neither should you.
 - If the user only wants to stop auto-sync for one tool but keep TeamAI otherwise,

@@ -323,8 +323,28 @@ export const TeamaiConfigSchema = z.object({
   // wrong guess can never create a junk config file on a user's machine.
   toolPaths: z.record(z.string(), ToolPathsSchema).default({
     claude: { skills: '.claude/skills', rules: '.claude/rules', settings: '.claude/settings.json', claudemd: '.claude/CLAUDE.md', agents: '.claude/agents', mcp: '.claude.json', mcpProject: '.mcp.json' },
-    codex: { skills: '.codex/skills', rules: '.codex/rules', settings: '.codex/hooks.json', agents: '.codex/agents', mcp: '.codex/config.toml' },
-    'codex-internal': { skills: '.codex-internal/skills', rules: '.codex-internal/rules', settings: '.codex-internal/hooks.json', agents: '.codex-internal/agents' },
+    // Codex reads no rules directory: `.codex/rules` holds its exec-policy
+    // `*.rules` files. In user scope teamai's blocks go to ~/.codex/AGENTS.md,
+    // which only Codex reads. In project scope they come from the session-start
+    // hook, since the project AGENTS.md is the owners' file and other tools
+    // read it too (#938, #945); so the entry has no project `claudemd`.
+    codex: {
+      skills: '.codex/skills',
+      settings: '.codex/hooks.json',
+      agents: '.codex/agents',
+      mcp: '.codex/config.toml',
+      userScope: { claudemd: '.codex/AGENTS.md' },
+    },
+    // codex-internal and tcodex run the same Codex from their own home root, so
+    // they take the codex shape. Their user-scope AGENTS.md locations
+    // (~/.codex-internal/AGENTS.md, ~/.tcodex/AGENTS.md) are assumed from that,
+    // not verified against either build.
+    'codex-internal': {
+      skills: '.codex-internal/skills',
+      settings: '.codex-internal/hooks.json',
+      agents: '.codex-internal/agents',
+      userScope: { claudemd: '.codex-internal/AGENTS.md' },
+    },
     'claude-internal': { skills: '.claude-internal/skills', rules: '.claude-internal/rules', settings: '.claude-internal/settings.json', claudemd: '.claude-internal/CLAUDE.md', agents: '.claude-internal/agents' },
     // tclaude ships Claude Code with `customUserDataDir: .tclaude`, which
     // relocates the whole user data dir — so its MCP file is
@@ -332,7 +352,13 @@ export const TeamaiConfigSchema = z.object({
     // for the Claude family is <root>/.mcp.json, which the `claude` target
     // already writes and tclaude reads from the same location.
     tclaude: { skills: '.tclaude/skills', rules: '.tclaude/rules', settings: '.tclaude/settings.json', claudemd: '.tclaude/CLAUDE.md', agents: '.tclaude/agents', mcp: '.tclaude/.claude.json' },
-    tcodex: { skills: '.tcodex/skills', rules: '.tcodex/rules', settings: '.tcodex/hooks.json', agents: '.tcodex/agents' },
+    // Same shape as codex; see codex-internal above.
+    tcodex: {
+      skills: '.tcodex/skills',
+      settings: '.tcodex/hooks.json',
+      agents: '.tcodex/agents',
+      userScope: { claudemd: '.tcodex/AGENTS.md' },
+    },
     cursor: { skills: '.cursor/skills', rules: '.cursor/rules', settings: '.cursor/hooks.json', agents: '.cursor/agents', mcp: '.cursor/mcp.json', mcpProject: '.cursor/mcp.json' },
     // GitHub Copilot CLI keeps project customizations under .github and moves
     // the complete user customization root when COPILOT_HOME is set. Agents use
@@ -880,6 +906,11 @@ export interface HookDef {
   command: string;
   /** Per-hook timeout in seconds (tool-specific; omitted = tool default). */
   timeout?: number;
+  /**
+   * Codex only: the token count past which Codex keeps just the start and end
+   * of the hook's additionalContext. 0 turns that off. Omitted = Codex's 2,500.
+   */
+  additionalContextLimit?: number;
   /** settings.json description. builtin: "[teamai] <key>"; team: "[teamai:hook:<id>] ...". */
   description: string;
   /** Team hooks only: restrict to these tools (default = all hook-capable tools). */
@@ -1093,6 +1124,13 @@ export const TEAMAI_AGENT_HOOK_PREFIX = '[teamai:agent-hook:';
 export const TEAMAI_ENV_START = '# [teamai:env:start]';
 export const TEAMAI_ENV_END = '# [teamai:env:end]';
 
+/**
+ * The team rules inlined into the user-scope instructions file of a tool with
+ * no rules format (the Codex family, #938). Not `[teamai:rules]`: pull strips
+ * that legacy marker from every `claudemd` file.
+ */
+export const TEAMAI_TEAM_RULES_START = '<!-- [teamai:team-rules:start] -->';
+export const TEAMAI_TEAM_RULES_END = '<!-- [teamai:team-rules:end] -->';
 export const TEAMAI_CULTURE_START = '<!-- [teamai:culture:start] -->';
 export const TEAMAI_CULTURE_END = '<!-- [teamai:culture:end] -->';
 

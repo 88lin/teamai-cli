@@ -20,6 +20,7 @@ import {
 } from './types.js';
 import { isToolInstalledForConfig } from './resources/base.js';
 import { skillsDirForTool } from './resources/skills.js';
+import { getsRulesFromSessionHook } from './resources/rule-format.js';
 import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder } from './hooks.js';
 import {
   buildDeliveryChecks,
@@ -295,8 +296,54 @@ async function buildHookChecks(
       },
       fix: 'Run `teamai hooks inject` to inject/update hooks',
     });
+    if (getsRulesFromSessionHook(tool)) checks.push(sessionHookRulesCheck(tool, settingsPath));
   }
   return checks;
+}
+
+/**
+ * In a project the Codex family gets the team rules and instruction blocks
+ * from its session hooks (#938, #945): SessionStart, and SubagentStart for a
+ * fresh subagent, which fires no SessionStart. Past 2,500 tokens Codex keeps
+ * only the start and end of a hook's context unless the entry sets
+ * `additionalContextLimit: 0`. A missing session-start entry is the hooks
+ * check's to report.
+ */
+function sessionHookRulesCheck(tool: string, settingsPath: string): Check {
+  return {
+    name: `Project rules and instructions reach ${tool} whole through its session hooks`,
+    source: 'local',
+    check: async () => {
+      const sessionStart = await teamaiHookEntries(settingsPath, 'SessionStart', 'session-start');
+      if (sessionStart.length === 0) return true;
+      const subagentStart = await teamaiHookEntries(settingsPath, 'SubagentStart', 'subagent-start');
+      return [sessionStart, subagentStart].every((entries) => entries.some((entry) => entry.additionalContextLimit === 0));
+    },
+    fix: `The teamai SessionStart and SubagentStart entries in ${settingsPath} must both exist and set `
+      + `\`additionalContextLimit: 0\`. Without them ${tool} keeps only the start and end of a large set of `
+      + 'team rules and instructions, and a fresh subagent gets none. Run `teamai pull` to rewrite them'
+      + (isCodexTrustGatedTool(tool) ? ', then approve the changed hooks in Codex (/hooks).' : '.'),
+  };
+}
+
+/** The teamai handlers for one event in a Codex hooks.json; none when it does not parse. */
+async function teamaiHookEntries(
+  settingsPath: string,
+  event: 'SessionStart' | 'SubagentStart',
+  subcommand: string,
+): Promise<Array<{ additionalContextLimit?: unknown }>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFileSafe(settingsPath) ?? '');
+  } catch {
+    return [];
+  }
+  const groups = (parsed as { hooks?: Record<string, unknown> } | null)?.hooks?.[event];
+  if (!Array.isArray(groups)) return [];
+  return groups
+    .flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []))
+    .filter((entry): entry is { command: string; additionalContextLimit?: unknown } =>
+      typeof entry?.command === 'string' && entry.command.includes(`teamai hook-dispatch ${subcommand}`));
 }
 
 

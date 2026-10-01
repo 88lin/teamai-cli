@@ -673,6 +673,77 @@ describe('buildChecks', () => {
     });
 });
 
+// #938: Codex gets the team rules from its session-start hook. Past 2,500
+// tokens Codex keeps only the start and end of a hook's context unless the
+// entry sets additionalContextLimit: 0.
+describe('buildChecks — the Codex team rules hook (#938)', () => {
+    const NAME = 'Project rules and instructions reach codex whole through its session hooks';
+    const DISPATCH = 'bash -lc "teamai hook-dispatch session-start --tool codex 2>/dev/null" || true';
+    const SUBAGENT = 'bash -lc "teamai hook-dispatch subagent-start --tool codex 2>/dev/null" || true';
+    // An entry for SubagentStart with the limit, unless a test passes its own.
+    const sessionStart = (entry: Record<string, unknown>, subagent: Record<string, unknown> | null = { command: SUBAGENT, additionalContextLimit: 0 }) => JSON.stringify({
+        hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', ...entry }] }],
+            ...(subagent ? { SubagentStart: [{ hooks: [{ type: 'command', ...subagent }] }] } : {}),
+        },
+    });
+
+    async function codexCheck(hooksJson: string) {
+        mockedLoadLocalConfig.mockResolvedValue({ ...mockLocalConfig, enabledAgents: ['claude', 'codex'] });
+        mockedLoadTeamConfig.mockResolvedValue({
+            ...mockTeamConfig,
+            toolPaths: { ...mockTeamConfig.toolPaths, codex: { settings: '.codex/hooks.json', skills: '.codex/skills' } },
+        });
+        const fallback = mockedReadFileSafe.getMockImplementation()!;
+        mockedReadFileSafe.mockImplementation(async (filePath: string) => (
+            filePath.endsWith(path.join('.codex', 'hooks.json')) ? hooksJson : fallback(filePath)
+        ));
+        const ctx = await resolveDoctorContext();
+        if (!ctx) throw new Error('expected a resolved doctor context');
+        return (await buildChecks(ctx)).find((c) => c.name === NAME);
+    }
+
+    it('passes when the teamai session-start entry sets additionalContextLimit 0', async () => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }));
+
+        expect(await check!.check()).toBe(true);
+    });
+
+    it('fails on an entry an older pull wrote without the limit, naming the file, the fix and the approval', async () => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH }));
+
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain(path.join('.codex', 'hooks.json'));
+        expect(check!.fix).toContain('additionalContextLimit');
+        expect(check!.fix).toContain('teamai pull');
+        expect(check!.fix).toContain('/hooks');
+    });
+
+    it('leaves a missing entry to the hooks check', async () => {
+        const check = await codexCheck(sessionStart({ command: 'my-own-hook' }));
+
+        expect(await check!.check()).toBe(true);
+    });
+
+    it.each([
+        ['missing', null],
+        ['without the limit', { command: SUBAGENT }],
+    ])('fails when the SubagentStart entry is %s, since a fresh subagent fires no SessionStart', async (_label, subagent) => {
+        const check = await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }, subagent));
+
+        expect(await check!.check()).toBe(false);
+        expect(check!.fix).toContain('SubagentStart');
+        expect(check!.fix).toContain('Run `teamai pull`');
+    });
+
+    it('asks nothing of a tool that reads its own rules directory', async () => {
+        await codexCheck(sessionStart({ command: DISPATCH, additionalContextLimit: 0 }));
+        const ctx = await resolveDoctorContext();
+
+        expect((await buildChecks(ctx!)).map((c) => c.name).filter((n) => n.startsWith('Project rules and instructions reach'))).toEqual([NAME]);
+    });
+});
+
 // A tool listed in enabledAgents is a claim by the user that they use it. Until
 // #598 the registry answered that claim with silence: buildHookChecks skipped
 // any tool whose settings directory was missing — the same silent skip #574
