@@ -14,7 +14,7 @@ import {
 } from '../roles.js';
 import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../projects.js';
 import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
-import { assertWithinRoot } from '../utils/path-safety.js';
+import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
 import { keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
 
@@ -557,13 +557,16 @@ export class SkillsHandler extends ResourceHandler {
     const tombstones = await this.readTombstones(localConfig);
     const pushIgnoredSkills = await readPushIgnoredSkills();
 
-    // Load source skill names to exclude from push candidates (Codex finding #1)
+    // Quarantine ambiguous names; modern source records are excluded by physical path.
     let sourceSkillNames: Set<string>;
+    let sourcePathOwners: Array<{ path: string; manifestPath?: string }>;
     try {
-      const { getAllSourceSkillNames } = await import('../source.js');
-      sourceSkillNames = await getAllSourceSkillNames();
-    } catch {
-      sourceSkillNames = new Set();
+      const { getSourcePushQuarantineNames, getSourcePathOwners } = await import('../source.js');
+      sourceSkillNames = await getSourcePushQuarantineNames(localConfig);
+      sourcePathOwners = await getSourcePathOwners();
+    } catch (error) {
+      log.warn(`Skipping skill push because source ownership tracking could not be read safely: ${(error as Error).message}`);
+      return [];
     }
 
     // Collect the best candidate for each skill name across all tool directories
@@ -583,7 +586,16 @@ export class SkillsHandler extends ResourceHandler {
         if (pushIgnoredSkills.has(dir)) continue;
         if (blockedSkills.has(dir)) continue; // Skip skills in non-allowed namespaces
         if (isCliOwnedSkillName(dir)) continue; // Skip CLI built-in skills, current and legacy
-        if (sourceSkillNames.has(dir)) continue; // Skip cross-team source skills
+        if (sourceSkillNames.has(dir)) continue; // Quarantine legacy/unpinned names
+        // Compare the file actually scanned, not a future deployment target:
+        // recursive scans and Codex's shared directory can differ from that target.
+        const physicalPath = resolveReal(localDirPath);
+        const sourceOwner = sourcePathOwners.find((owner) => owner.path === physicalPath
+          || owner.path.startsWith(physicalPath + path.sep) || physicalPath.startsWith(owner.path + path.sep));
+        if (sourceOwner) {
+          log.warn(`Skill "${dir}" is owned by another source installation and is excluded from push. Ownership record: ${sourceOwner.manifestPath}`);
+          continue;
+        }
 
         if (teamSkills.has(dir)) {
           // Skill exists in team repo — check if content differs

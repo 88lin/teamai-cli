@@ -233,8 +233,9 @@ export function resolveCoAuthor(
 //            │    teamai source browse <name>          │  teamai pull
 //            │             │                           │
 //            ▼             ▼                           ▼
-//  ~/.teamai/sources/<name>/repo/  ← git clone
-//  ~/.teamai/sources/<name>/installed.json ← manifest
+//  ~/.teamai/source-repos/<repo-url-sha256>/repo/ ← git clone
+//  ~/.teamai/source-repos/<repo-url-sha256>/last-pull.json ← repo pull TTL
+//  ~/.teamai/sources/<name>/installations/<installation-id>.json ← per-team, per-destination manifest
 //            │
 //            ▼
 //  ~/.claude/skills/<skill-name>/  ← copy (original name, local team wins on conflict)
@@ -249,14 +250,22 @@ export const SourceConfigSchema = z.object({
 
 export type SourceConfig = z.infer<typeof SourceConfigSchema>;
 
-/** Installed skill manifest for a single source. Persisted to sources/<name>/installed.json. */
+/** Source installation manifest, keyed by team checkout and resource destination. */
 export interface SourceInstallManifest {
+  /** Absolute destination root, allowing other installations to protect shared paths. */
+  destinationRoot?: string;
+  /** Consumer checkout, retained for manual review even if it is moved or deleted. */
+  teamCheckout?: string;
+  /** Hash of the configured repository URL, used to reject conflicting writers. */
+  repositoryId?: string;
   /** ISO timestamp of last successful pull. */
   lastPull: string;
   /** Skill names currently deployed from this source. */
   installedSkills: string[];
   /** Per-skill deployment paths, relative to the configured scope root. */
   installedPaths?: Record<string, string[]>;
+  /** Original physical destination for each recorded relative deployment path. */
+  installedPhysicalPaths?: Record<string, string>;
 }
 
 /** TTL for source repo pull: don't re-pull within this duration (ms). */
