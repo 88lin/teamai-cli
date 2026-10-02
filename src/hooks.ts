@@ -23,6 +23,9 @@ import { builtinHookDefs, applyBuiltinOverride, skipToolsWithoutShell, toolUsesC
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { resolveTeamHooks } from './resources/hooks.js';
 import { getUserHome } from './utils/home.js';
+import { CLAUDE_HOOK_OTHER_HOST_SKIP } from './claude-hook-host.js';
+
+export { CLAUDE_HOOK_OTHER_HOST_SKIP };
 
 /**
  * Lobster-family agents (OpenClaw engine) that use HOOK.md + handler.ts instead
@@ -363,9 +366,24 @@ function isProjectGatedCommand(command: string): boolean {
   return command.startsWith('if [ "$PWD" = ') || command.startsWith('cd| findstr ');
 }
 
+/**
+ * Team commands written for `claude` exit when Cursor or Copilot CLI runs them
+ * and that host's own teamai hooks are installed. The prefix checks the hook
+ * file; it does not skip a claude-only setup. Built-in hooks take the same
+ * exit inside hook-dispatch instead of here.
+ */
+function skipWhenAnotherHostLoadsClaudeSettings(command: string, tool: string): string {
+  if (tool !== 'claude') return command;
+  return `${CLAUDE_HOOK_OTHER_HOST_SKIP}${command}`;
+}
+
 function scopedTeamDefs(teamDefs: HookDef[], projectRoot: string | undefined, tool: string): HookDef[] {
-  if (!projectRoot) return teamDefs;
-  return teamDefs.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot, tool) }));
+  const prepared = teamDefs.map((def) => ({
+    ...def,
+    command: skipWhenAnotherHostLoadsClaudeSettings(def.command, tool),
+  }));
+  if (!projectRoot) return prepared;
+  return prepared.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot, tool) }));
 }
 
 function manifestRecordsForTool(teamDefs: HookDef[], tool: string, removeAll: boolean, projectRoot?: string): ManagedHookRecord[] {

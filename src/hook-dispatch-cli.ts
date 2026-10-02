@@ -28,6 +28,9 @@ import { resolveHookCwd } from './utils/hook-cwd.js';
 import { windowsPowerShell } from './utils/powershell.js';
 import { log, setStderrOnly } from './utils/logger.js';
 import { deriveDispatchSessionId } from './utils/session-id.js';
+import { claudeHookRunsInAnotherHost } from './claude-hook-host.js';
+
+export { claudeHookRunsInAnotherHost };
 
 /**
  * Max time to wait for STDIN EOF before proceeding with whatever was received.
@@ -415,6 +418,10 @@ export async function hookDispatchCli(
 ): Promise<void> {
   const { bgOnly = false, stdinFile } = options;
   setStderrOnly(true);
+  if (claudeHookRunsInAnotherHost(tool)) {
+    log.debug('hook-dispatch: skipping claude hooks because Cursor or Copilot CLI has its own teamai hooks');
+    return;
+  }
   try {
     const raw = stdinFile ? readStdinFile(stdinFile) : await readStdin();
     const stdin = parseStdin(raw, event);
