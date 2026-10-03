@@ -46,7 +46,7 @@ export function computeConfidence(factors: ConfidenceFactors): number {
  */
 export async function computeAllConfidence(votesDir: string): Promise<Map<string, number>> {
   const result = new Map<string, number>();
-  const { loadUserVotes } = await import('../votes.js');
+  const { readUserVotes } = await import('../votes.js');
   const files = await listFiles(votesDir);
 
   const aggregated = new Map<string, { recalled: number; upvoted: number; lastRecalled: string; lastUpvoted?: string }>();
@@ -54,7 +54,7 @@ export async function computeAllConfidence(votesDir: string): Promise<Map<string
   for (const file of files) {
     if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
     try {
-      const data = await loadUserVotes(path.join(votesDir, file));
+      const data = await readUserVotes(path.join(votesDir, file));
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = aggregated.get(docId) ?? { recalled: 0, upvoted: 0, lastRecalled: '' };
         existing.recalled += entry.recalled_count ?? 0;

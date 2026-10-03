@@ -171,21 +171,23 @@ export function migrateV1ToV2(v1: UserVotes): UserVotesV2 {
 }
 
 /**
- * Load user votes from a YAML file, auto-migrating v1 to v2 on first read.
+ * Parse a votes file into the v2 shape. `migrated` is true only for a real v1
+ * file, i.e. exactly when a caller that wants the upgrade on disk has to save.
  */
-export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
+async function parseUserVotes(votePath: string): Promise<{ data: UserVotesV2; migrated: boolean }> {
+  const empty = { data: { version: 2, votes: {}, deltas: {} } as UserVotesV2, migrated: false };
   const content = await readFileSafe(votePath);
-  if (!content) return { version: 2, votes: {}, deltas: {} };
+  if (!content) return empty;
 
   let parsed: unknown;
   try {
     parsed = YAML.parse(content);
   } catch {
-    return { version: 2, votes: {}, deltas: {} };
+    return empty;
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return { version: 2, votes: {}, deltas: {} };
+    return empty;
   }
 
   const obj = parsed as Record<string, unknown>;
@@ -193,16 +195,37 @@ export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
   if (obj['version'] === 2) {
     const v2 = obj as unknown as UserVotesV2;
     if (!v2.deltas) v2.deltas = {};
-    return v2;
+    return { data: v2, migrated: false };
   }
 
   if (obj['votes'] !== undefined) {
-    const migrated = migrateV1ToV2(obj as unknown as UserVotes);
-    await saveUserVotes(votePath, migrated);
-    return migrated;
+    return { data: migrateV1ToV2(obj as unknown as UserVotes), migrated: true };
   }
 
-  return { version: 2, votes: {}, deltas: {} };
+  return empty;
+}
+
+/**
+ * Read user votes without ever writing: a v1 file is migrated in memory only.
+ *
+ * Read-only callers must use this instead of {@link loadUserVotes}, whose
+ * migration write turns a scan or a `--dry-run` preview into a rewrite of every
+ * v1 votes file it touches (issue #900, C7).
+ */
+export async function readUserVotes(votePath: string): Promise<UserVotesV2> {
+  return (await parseUserVotes(votePath)).data;
+}
+
+/**
+ * Load user votes from a YAML file, persisting the v1 → v2 upgrade on first read.
+ *
+ * Only for callers that are about to write anyway (they hold the per-file lock).
+ * Anything read-only wants {@link readUserVotes}.
+ */
+export async function loadUserVotes(votePath: string): Promise<UserVotesV2> {
+  const { data, migrated } = await parseUserVotes(votePath);
+  if (migrated) await saveUserVotes(votePath, data);
+  return data;
 }
 
 /**
