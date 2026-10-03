@@ -127,6 +127,8 @@ vi.mock('../hooks.js', async (importOriginal) => ({
   reconcileTeamHooksForConfig: vi.fn(async () => ({ ok: true, defs: [] })),
   hasTeamaiHooks: vi.fn(async () => true),
   reconcileHooks: vi.fn(),
+  trustCodexForScope: vi.fn(async () => undefined),
+  reportCodexTrust: vi.fn(),
 }));
 
 const mockDeployBuiltinSkills = vi.fn().mockResolvedValue(0);
@@ -750,6 +752,13 @@ describe('init', () => {
         expect.objectContaining({ team: expect.any(String) }),
         expect.anything(),
       );
+    });
+
+    it('trusts Codex after injecting hooks and forces the initialization pass', async () => {
+      const { reconcileTeamHooksForConfig, trustCodexForScope } = await import('../hooks.js');
+      await initWithTeamConfig();
+      expect(trustCodexForScope).toHaveBeenCalledWith(expect.anything(), expect.anything(), { filterAgents: undefined, force: true });
+      expect(vi.mocked(reconcileTeamHooksForConfig).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(trustCodexForScope).mock.invocationCallOrder[0]);
     });
 
     it('announces the stub as ready only when it landed', async () => {

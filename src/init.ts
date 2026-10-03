@@ -2,7 +2,7 @@ import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
-import { describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig } from './hooks.js';
+import { describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
 import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward } from './utils/git.js';
 import { pushRepoDirectly } from './utils/git.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
@@ -792,10 +792,13 @@ async function reconcileHooksForInit(
   try {
     reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
   } catch (e) {
-    // The agent hooks are in place; the rest of init (its pull) still runs.
+    // The agent hooks are in place; the rest of init still runs.
     log.error((e as Error).message);
     process.exitCode = 1;
     return;
+  } finally {
+    // Git-hook installation can fail after the Codex hooks were written.
+    reportCodexTrust(await trustCodexForScope(teamConfig, localConfig, { filterAgents, force: true }), 'all');
   }
   if (!reconciled.ok) log.warn(describeUnappliedTeamHooks(reconciled));
   // The hooks install the extensions and plugins that add team instructions

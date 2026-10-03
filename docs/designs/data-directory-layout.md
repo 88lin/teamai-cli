@@ -495,7 +495,14 @@ every checkout, so that is where they live now:
 ├── learnings-wt/                              getWorktreeDir → <dataHome>/<dirname>
 ├── reports-wt/                                (the side-branch locks sit beside them)
 ├── pending-learnings/                         pendingLearningsDir → <dataHome>/pending-learnings
+├── managed-main-checkout-hooks.json           team hooks teamai wrote ungated into the main checkout's Claude Code / Codex
+│                                              settings, shared by every checkout (#955; the built-in hooks stay in HOME)
+│                                              project toolPaths choose the files; Claude uses settings.local.json beside its settings file
+│                                              Codex records event, matcher-group position and complete rendered entry; unique definitions recover moved entries
+│                                              legacy ownership matches event/matcher/command uniquely, ignoring unrecorded timeout/context options
+│                                              pre-#370 Codex ownership is imported from <main>/.teamai/managed-hooks.json before reconcile/removal
 └── workspaces/<managedMcpWorkspaceId(root)>/
+    ├── managed-main-checkout-hooks.json       bare repositories only: this workspace owns its Claude / Codex team-hook files and trust target
     ├── managed-mcp.json                       managedMcpManifestPath, one per checkout; Copilot placement is true for bare, false for keyed, absent when unproven
     ├── managed-mcp-files.json                 resolvedMcpFilesPath: project MCP configs teamai may have written a resolved ${VAR} to, and whether
     │                                          the paths earlier teamai.yaml revisions mapped were read; one of those git tracks is marked tracked (#882);

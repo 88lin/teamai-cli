@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, sweepLegacyProjectHooks, getHookStatus, hasInstalledCodexTrustGatedTool, codexTrustReminder, type HookStatus } from './hooks.js';
+import { reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
 import { applyBuiltinOverride, installedBuiltinHookDefs } from './builtin-hooks.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { describeEntryFailure, describeOrigin, reportUndeliveredEntryNotices } from './namespaced-entries.js';
@@ -10,6 +10,7 @@ import {
     COPILOT_TOOL_ID,
     getManagedHooksPath,
     isAgentExcluded,
+    isSelfMode,
     resolveHookScope,
     resolveToolBaseDir,
     scopedToolPaths,
@@ -98,30 +99,22 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
 
     // Explicit user action → not gated by sharing.hooks.autoApply (auto: false).
-    const { baseDir } = resolveHookScope(localConfig);
-    const reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
-        auto: false,
-        silent: options.silent,
-    });
+    let reconciled: Awaited<ReturnType<typeof reconcileTeamHooksForConfig>>;
+    try {
+        reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
+            auto: false,
+            silent: options.silent,
+        });
+    } finally {
+        // Git-hook installation can fail after the Codex hooks were written.
+        const codexTrust = await trustCodexForScope(teamConfig, localConfig, { force: true });
+        if (!options.silent) reportCodexTrust(codexTrust, 'all');
+    }
     // The reason is already reported; the installed team hooks were left as they were.
     if (!reconciled.ok) {
         process.exitCode = 1;
-        return;
     }
-    let codexTrustGated = false;
-    if (await hasInstalledCodexTrustGatedTool(teamConfig.toolPaths, baseDir)) {
-        codexTrustGated = true;
-    }
-
-    if (!options.silent) {
-        log.success('Hooks injected into all AI tool settings');
-        // The public Codex gates non-managed hooks behind an explicit trust step;
-        // remind the user to trust them in Codex. teamai never edits [hooks.state]
-        // to auto-trust (constraint: reminder only, no bypass).
-        if (codexTrustGated) {
-            log.warn(codexTrustReminder());
-        }
-    }
+    if (!options.silent && reconciled.ok) log.success('Hooks injected into all AI tool settings');
 }
 
 /**
@@ -280,10 +273,15 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     // Removal must target the same paths injection used. A non-self project
     // scope injects into HOME, so resolving the project-scope paths here would
     // miss (and leave behind) every tool whose user-scope prefix differs.
-    await reconcileHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, [], manifestPath, {
+    const reconciledMainTools = await reconcileHooksToAllTools(scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope }), baseDir, [], manifestPath, {
         removeAll: true,
         scope: localConfig.scope,
         installedBaseDir: localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
+        teamHookProjectRoot: localConfig.scope === 'project' && !isSelfMode(localConfig)
+            ? localConfig.projectRoot
+            : undefined,
+        // The project's Claude and Codex team hooks live in the main checkout.
+        mainCheckout: await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths),
     });
 
     const copilotPaths = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID];
@@ -304,7 +302,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     // differs from the primary target — never HOME (shared with user scope, and
     // the primary target itself when projectRoot IS the home dir), and never
     // re-running on the primary target in self mode.
-    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig);
+    await sweepLegacyProjectHooks(teamConfig.toolPaths, localConfig, reconciledMainTools);
 
     // Pi has one shared user extension. `hooks remove` is an explicit global
     // hook-disable action even when invoked from a project; project uninstall

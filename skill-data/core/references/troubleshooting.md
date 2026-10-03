@@ -31,8 +31,22 @@ This is the #1 onboarding issue. In order:
    ```bash
    teamai hooks inject
    ```
-4. **Wrong scope?** Project-scope hooks are written to your HOME tool settings
-   (e.g. `~/.claude/settings.json`), not the project folder — that is intentional.
+4. **Wrong scope?** Project-scope built-in hooks are written to your HOME tool
+   settings (e.g. `~/.claude/settings.json`), not the project folder; the team's own
+   hooks for Claude Code and Codex go to the main checkout
+   (`.claude/settings.local.json`, `.codex/hooks.json`). That is intentional.
+   Existing Claude/Codex main-checkout hook files count as installed targets
+   even when HOME and current worktree tool roots are missing. Injection and
+   pull update team hooks and restore HOME built-ins; removal clears managed
+   main-checkout hooks without recreating HOME roots.
+   If Git-hook installation fails after writing agent hooks, `hooks inject`,
+   `init` and self-repo bootstrap still attempt Codex trust. Injection preserves
+   the installation error without reporting overall success. Init reports the
+   error and retains exit code 1 while completing local setup, including HTTP
+   initialization. Bootstrap records the error in the debug log and continues
+   local setup.
+   In project scope, `teamai hooks remove` preserves other projects' gated team
+   hooks in HOME, while removing the shared built-in hooks.
    If you initialized project scope but expected machine-wide resources, re-run
    with `--scope user`.
 5. **Tool has no hook surface** (e.g. Gemini CLI, JoyCode): there is no auto-sync;
@@ -173,7 +187,7 @@ broken machine):
 | Tool                  | Hooks status              | Why                                                                 |
 |-----------------------|---------------------------|---------------------------------------------------------------------|
 | Claude Code (`claude`)| Installed                 | Fully supported — this is the main, working path                    |
-| Codex                 | Written but **trust-gated** or skipped | Codex gates non-managed hooks behind an explicit trust step; `teamai doctor` prints a reminder to trust them |
+| Codex                 | Installed and trusted     | Codex runs only trusted hooks; teamai trusts the ones it writes through `codex app-server`, and `teamai doctor` names any Codex will not run |
 | Cursor                | Installed                 | Also runs `~/.claude/settings.json`. That copy exits only when `~/.cursor/hooks.json` or the project `.cursor/hooks.json` contains `--tool cursor` |
 | Copilot CLI           | Installed in self mode    | Also runs a trusted project's `.claude/settings.json`. That copy exits only when `.github/hooks/teamai.json` contains `--tool copilot`. `COPILOT_CLI` alone does not skip |
 | CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`                    |
@@ -192,11 +206,23 @@ step — do not assume auto-sync just works.
 
 ### Codex
 
-Codex gates non-managed hooks behind an explicit **trust** step. `teamai init` /
-`teamai hooks inject` may write the hooks, but Codex won't run them until the user
-trusts them (`teamai doctor` prints a reminder when it detects this). Guide the
-user to trust the teamai hooks in Codex, then reopen a session. Until then, run
-`teamai pull` manually.
+Codex runs a non-managed hook only once it is **trusted**. `teamai init`, `pull`
+and `teamai hooks inject` trust the hooks they write (and, in a project, the main
+checkout, or the current worktree for a bare repository) through `codex app-server`.
+Trust written by a session-start pull applies from the next Codex session. `teamai doctor` names any teamai hook Codex will not
+run. Then: run `teamai pull`; if `codex` is not on PATH or `codexTrustEnabled: false`
+is set in `config.yaml`, guide the user to trust the teamai hooks in Codex `/hooks`,
+then reopen a session. A new linked worktree gets the team hooks from its second
+Codex session (the first creates its `.codex/`). Member hooks with the same command
+are preserved and remain untouched by automatic trust. Codex ownership uses the
+recorded event, position and complete entry. A moved entry is recovered only by a
+unique full-definition match. Legacy records recover only a unique event, matcher
+and command match; `timeout` and `additionalContextLimit` were not recorded.
+Pre-#370 project Codex ownership is imported from the main checkout's
+`.teamai/managed-hooks.json` before reconciliation or direct removal.
+Unrecorded or ambiguous legacy team-hook copies are preserved. Project hook paths follow `toolPaths`;
+Claude uses `settings.local.json` beside its configured settings file. A custom
+Codex path that Codex does not load is reported as `not loaded` by doctor.
 
 ### Cursor
 

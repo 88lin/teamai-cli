@@ -1,6 +1,7 @@
+import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope, UnreadableProjectConfigError } from './config.js';
-import { reconcileHooks, hasTeamaiHooks } from './hooks.js';
+import { reconcileHooks, hasTeamaiHooks, mainCheckoutHookFile, resolveMainCheckoutHooks } from './hooks.js';
 import {
   removeOpenClawHooks,
   OPENCLAW_HOOK_DIR,
@@ -70,6 +71,7 @@ import { listQueuesIn } from './utils/pending-learnings.js';
 import { log } from './utils/logger.js';
 import { askConfirmation } from './utils/prompt.js';
 import { getUserHome } from './utils/home.js';
+import { listWorktrees } from './utils/git.js';
 import {
   detectShellProfile,
   findEnvBlockFor,
@@ -86,7 +88,7 @@ interface UninstallOptions extends GlobalOptions {
 interface RemovalPlan {
   /** Tool settings files that contain teamai hooks (each with the manifest that
    *  recorded its team hooks — HOME/user or a legacy <projectRoot>/project one). */
-  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string; teamOnly?: boolean; legacyManifestPath?: string }>;
   /** OpenClaw-style hook dirs (<base>/.<tool>/hooks) holding teamai HOOK.md+handler.ts. */
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
   /** OpenCode teamai plugin files (.opencode/plugin/teamai-*.ts) to delete. */
@@ -159,7 +161,7 @@ interface OpencodeInstruction {
 }
 
 interface ToolResources {
-  hookFiles: Array<{ path: string; tool: string; manifestPath: string }>;
+  hookFiles: Array<{ path: string; tool: string; manifestPath: string; teamOnly?: boolean; legacyManifestPath?: string }>;
   openclawHookDirs: Array<{ hooksDir: string; tool: string }>;
   opencodeHookScopes: Array<{ baseDir: string; scope: Scope }>;
   ompHookFile: string | null;
@@ -313,6 +315,19 @@ function opencodePluginTargets(baseDir: string, scope: Scope): Array<{ baseDir: 
 
 // ─── Discovery ─────────────────────────────────────────
 
+/**
+ * A location teamai injected hooks into. `fileFor` names the file per tool for
+ * a location that holds only some tools' files (the main checkout's team hook
+ * files, #955); without it the tool's settings path is probed.
+ */
+interface HookTarget {
+  baseDir: string;
+  manifestPath: string;
+  fileFor?: (tool: string) => string | null;
+  teamOnly?: boolean;
+  legacyManifestPath?: string;
+}
+
 async function discoverToolResources(
   tool: string,
   toolPath: TeamaiConfig['toolPaths'][string],
@@ -322,7 +337,7 @@ async function discoverToolResources(
   teamSkillNames: Set<string>,
   teamRuleNames: Set<string>,
   teamAgentNames: Set<string>,
-  hookTargets: Array<{ baseDir: string; manifestPath: string }>,
+  hookTargets: HookTarget[],
   standaloneHookManifestPath: string,
   scope: Scope,
   /**
@@ -430,21 +445,32 @@ async function discoverToolResources(
     // from the same scope decision (`hookSettingsPath`), not from `toolPath` —
     // except for the legacy copy, written into <projectRoot> by a CLI that knew
     // nothing about a member's relocated root, so it sits at the team path.
-    for (const { baseDir: hookBaseDir, manifestPath } of hookTargets) {
+    // Main-checkout files are canonical; a legacy target may name one through a symlink.
+    const canonical = (file: string) => realpath(file).catch(() => path.resolve(file));
+    const mainFiles = new Set(await Promise.all(hookTargets.flatMap((target) => {
+      const file = target.teamOnly ? target.fileFor?.(tool) : null;
+      return file ? [canonical(file)] : [];
+    })));
+    for (const { baseDir: hookBaseDir, manifestPath, fileFor, teamOnly, legacyManifestPath } of hookTargets) {
       const settingsRel = path.resolve(hookBaseDir) === path.resolve(getUserHome())
         ? (hookSettingsPath ?? toolPath.settings)
         : toolPath.settings;
-      const settingsPath = path.join(hookBaseDir, settingsRel);
+      const settingsPath = fileFor ? fileFor(tool) : path.join(hookBaseDir, settingsRel);
+      // Prefer main-file ownership when a legacy target names the same file.
+      if (!teamOnly && settingsPath && mainFiles.has(await canonical(settingsPath))) continue;
       // Other installs use Codex's user hooks as their instruction channel.
-      if (!globalAdapters && CODEX_TOOL_IDS.some((id) => id === tool)
+      if (settingsPath && !globalAdapters && CODEX_TOOL_IDS.some((id) => id === tool)
         && path.resolve(hookBaseDir) === path.resolve(getUserHome())) {
         if (await pathExists(settingsPath) && await hasTeamaiHooks(settingsPath, tool, manifestPath)) res.keptGlobal.push(settingsPath);
         continue;
       }
-      if (await pathExists(settingsPath)
+      if (settingsPath && await pathExists(settingsPath)
         && (await hasTeamaiHooks(settingsPath, tool, manifestPath)
+          || (legacyManifestPath && await hasTeamaiHooks(settingsPath, tool, legacyManifestPath))
           || isEmptyHooksResidue(await readJson<Record<string, unknown>>(settingsPath)))) {
-        res.hookFiles.push({ path: settingsPath, tool, manifestPath });
+        res.hookFiles.push({ path: settingsPath, tool, manifestPath,
+          ...(teamOnly ? { teamOnly, legacyManifestPath } : {}),
+        });
       }
     }
   } else {
@@ -617,9 +643,30 @@ async function buildRemovalPlan(
   // the SessionStart hook live in HOME forever. A legacy <projectRoot> copy from
   // a pre-#370 CLI is swept too, tagged with its project manifest.
   const primaryHookScope = resolveHookScope(localConfig);
-  const hookTargets = [primaryHookScope];
+  const hookTargets: HookTarget[] = [primaryHookScope];
   const legacyHookScope = resolveLegacyProjectHookScope(localConfig);
   if (legacyHookScope) hookTargets.push(legacyHookScope);
+  // The project's Claude and Codex team hooks, in the main checkout (#955).
+  const mainCheckout = await resolveMainCheckoutHooks(localConfig, teamConfig.toolPaths);
+  const mainCheckouts = mainCheckout ? [mainCheckout] : [];
+  // A bare anchor has no shared checkout file. Uninstall removes the shared
+  // data home, so collect every live workspace's hooks before deleting ownership.
+  if (mainCheckout?.worktreeScoped) {
+    for (const root of await listWorktrees(localConfig.projectRoot!)) {
+      if (root === mainCheckout.root) continue;
+      const target = await resolveMainCheckoutHooks({ ...localConfig, projectRoot: root }, teamConfig.toolPaths);
+      if (target?.worktreeScoped) mainCheckouts.push(target);
+    }
+  }
+  for (const target of mainCheckouts) {
+    hookTargets.push({
+      baseDir: target.root,
+      manifestPath: target.manifestPath,
+      teamOnly: true,
+      legacyManifestPath: getManagedHooksPath('project', target.root),
+      fileFor: (tool) => mainCheckoutHookFile(target, tool),
+    });
+  }
   // Hook discovery resolves its file name at the same scope as the targets: a
   // non-self project scope discovers under HOME, so the tool paths there must be
   // the user-scope ones (previously the project-scope name was used, and a tool
@@ -1104,9 +1151,11 @@ async function executeRemoval(plan: RemovalPlan): Promise<RemovalPlan['opencodeI
   // or a legacy <projectRoot>/project copy), so team hooks are stripped at the
   // location that owns them. File-based adapters apply their own scope rules
   // below; in particular, project uninstall never owns Pi's global extension.
-  for (const { path: settingsPath, tool, manifestPath } of plan.hookFiles) {
+  for (const { path: settingsPath, tool, manifestPath, teamOnly, legacyManifestPath } of plan.hookFiles) {
     try {
-      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath });
+      await reconcileHooks(settingsPath, tool, [], { removeAll: true, manifestPath,
+        ...(teamOnly ? { teamOnly, legacyManifestPath } : {}),
+      });
     } catch (e) {
       log.warn(`Failed to remove hooks from ${settingsPath}: ${(e as Error).message}`);
     }

@@ -2342,6 +2342,104 @@ describe('uninstall', () => {
     expect(targetedProjectRoot).toBe(false);
   });
 
+  it('non-self project scope removes the Claude and Codex team hooks kept in the main checkout (#955)', async () => {
+    const projectRoot = path.join(tmpDir, 'proj-main-hooks');
+    const repoPath = path.join(projectRoot, '.teamai', 'team-repo');
+    const homeDir = path.join(tmpDir, 'home');
+    await fse.ensureDir(repoPath);
+    await fse.writeFile(path.join(projectRoot, '.teamai', 'config.yaml'), 'scope: project');
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    const teamEntry = { matcher: '*', hooks: [{ type: 'command', command: 'npm run lint' }], description: '[teamai:hook:lint] lint' };
+    await fse.outputJson(path.join(projectRoot, '.claude', 'settings.local.json'), { hooks: { Stop: [teamEntry] } });
+
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '/bin/bash');
+    const teamConfig = makeTeamConfig();
+    const localConfig = makeLocalConfig(projectRoot, repoPath, { scope: 'project', projectRoot });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    expect(mockReconcileHooks).toHaveBeenCalledWith(
+      path.join(await fse.realpath(projectRoot), '.claude', 'settings.local.json'),
+      'claude',
+      [],
+      expect.objectContaining({ removeAll: true, manifestPath: expect.stringContaining('managed-main-checkout-hooks.json') }),
+    );
+  });
+
+  it('uninstalls a coincident Codex main file once using current and legacy ownership', async () => {
+    const projectRoot = path.join(tmpDir, 'proj-codex-ownership');
+    const repoPath = path.join(projectRoot, '.teamai', 'team-repo');
+    const homeDir = path.join(tmpDir, 'home');
+    const file = path.join(projectRoot, '.codex', 'hooks.json');
+    await fse.ensureDir(repoPath);
+    await fse.outputFile(path.join(projectRoot, '.teamai', 'config.yaml'), 'scope: project');
+    await fse.outputJson(file, { hooks: { Stop: [
+      { hooks: [{ type: 'command', command: 'npm run lint' }] },
+      { hooks: [{ type: 'command', command: 'teamai pull --silent && ./notify' }] },
+    ] } });
+    await fse.outputJson(path.join(projectRoot, '.teamai', 'managed-hooks.json'), {
+      codex: [{ id: 'lint', event: 'Stop', command: 'npm run lint' }],
+    });
+    vi.stubEnv('HOME', homeDir);
+    const localConfig = makeLocalConfig(projectRoot, repoPath, { scope: 'project', projectRoot });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig: makeTeamConfig({
+      toolPaths: { codex: { settings: '.codex/hooks.json' } },
+    }) });
+    // Exercise the real reconciler after discovery, rather than just its wiring.
+    const { reconcileHooks } = await vi.importActual<typeof import('../hooks.js')>('../hooks.js');
+    mockReconcileHooks.mockImplementation(reconcileHooks);
+
+    await uninstall({ force: true });
+
+    const realFile = await fse.realpath(file);
+    const calls = await Promise.all(mockReconcileHooks.mock.calls.map((c) => fse.realpath(c[0]).catch(() => c[0])));
+    expect(calls.filter((c) => c === realFile)).toHaveLength(1);
+    expect((await fse.readJson(file)).hooks.Stop).toEqual([
+      { hooks: [{ type: 'command', command: 'teamai pull --silent && ./notify' }] },
+    ]);
+    expect(mockReconcileHooks).toHaveBeenCalledWith(
+      realFile, 'codex', [],
+      expect.objectContaining({ removeAll: true, teamOnly: true,
+        manifestPath: expect.stringContaining('managed-main-checkout-hooks.json'),
+        legacyManifestPath: expect.stringContaining('managed-hooks.json'),
+      }),
+    );
+  });
+
+  it('removes the separate team-hook files of live bare worktrees (#955)', async () => {
+    const bare = path.join(tmpDir, 'bare.git');
+    const first = path.join(tmpDir, 'first');
+    const second = path.join(tmpDir, 'second');
+    execFileSync('git', ['init', '--bare', bare]);
+    execFileSync('git', ['--git-dir', bare, 'worktree', 'add', '--orphan', first]);
+    execFileSync('git', ['--git-dir', bare, 'worktree', 'add', '--orphan', second]);
+    const repoPath = path.join(tmpDir, 'team-repo');
+    const homeDir = path.join(tmpDir, 'home');
+    const dataHome = path.join(homeDir, '.teamai', 'shared-project');
+    await fse.ensureDir(repoPath);
+    await fse.ensureDir(dataHome);
+    for (const root of [first, second]) {
+      await fse.outputJson(path.join(root, '.claude', 'settings.local.json'), {
+        hooks: { Stop: [{ matcher: '*', hooks: [{ type: 'command', command: 'npm run lint' }], description: '[teamai:hook:lint] lint' }] },
+      });
+    }
+    vi.stubEnv('HOME', homeDir);
+    const localConfig = makeLocalConfig(homeDir, repoPath, { scope: 'project', projectRoot: first, dataHome });
+    mockAutoDetectInit.mockResolvedValue({ localConfig, teamConfig: makeTeamConfig() });
+
+    await uninstall({ force: true });
+
+    const calls = mockReconcileHooks.mock.calls.filter((c) => String(c[0]).endsWith('settings.local.json'));
+    const files = await Promise.all([first, second].map(async (root) =>
+      path.join(await fse.realpath(root), '.claude', 'settings.local.json')));
+    expect(calls.map((c) => c[0]).sort()).toEqual(files.sort());
+    const manifests = calls.map((c) => c[3].manifestPath);
+    expect(new Set(manifests).size).toBe(2);
+    for (const manifest of manifests) expect(manifest).toMatch(/workspaces[/\\][a-f0-9]+[/\\]managed-main-checkout-hooks\.json$/);
+  });
+
   // #667: hook discovery must resolve the settings *file* at the scope hooks
   // were injected into, not at the config's scope. Qoder CN reads
   // `~/.qoder-cn/` for its user scope, so a non-self project scope (which

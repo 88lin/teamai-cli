@@ -628,7 +628,7 @@ teamai pull --dry-run    # 试运行，不实际修改
 
 **pull 会保留你修改过的 skill、rule 和 agent。** pull 按检出记录它在每个 skill、rule、agent 路径写入的内容。完整同步时，与记录不一致的副本会被保留并由 pull 指出，其他工具的副本照常更新。一个 skill 算作一份副本：它的任一团队文件被改动，整个 skill 都会保留；只有你自己添加的文件不计入。团队版本没有变化时，pull 输出 ``Kept <path>: you changed it since teamai delivered it. Share it with `teamai push`, or delete it and run `teamai pull --force` to get the team version back.``；团队版本也变了时（无论是团队改的，还是你的[本地模型别名覆盖](#本地覆盖)导致的），pull 给出警告，请你先把这项改动合并进自己的副本，再 push；由于 SessionStart 时的 pull 不输出信息，`teamai push` 也会对该副本给出警告。`--force` 同样保留这些副本，`--dry-run` 会逐个输出 `Would keep <path>`。团队删除某项资源时，你修改过的副本也会保留，并由 pull 指出。升级后第一次完整 pull 之前还没有记录，因此那次 pull 仍像旧版本一样覆盖，此后你的修改才受保护。新 worktree 的第一次 pull、以及 teamai 从未写入过该路径的副本，同样如此。`teamai remove` 和本地 agent 的安装仍会不经这项检查重写团队 rule。旧版 CLI 保存 state 时会丢弃这份记录。
 
-> Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为内置 hooks 依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。在没有 teamai 配置的目录中（既没有 project 配置也没有 user scope），团队 hooks 不做任何事：不显示提醒，也不记录会话或 skill 使用；只运行机器级别的工作（CLI 更新检查、SessionStart 时的 pull、本地 agent，以及 pull 暂存的包提示）。对团队 hooks 和 skill 使用记录而言，存在但无法读取的 project 配置视为没有配置，而不会退回 user scope，也不会退回其后优先级更低的 project 配置（如旧的 `.teamai/config.yaml`）。`pull` 遵循同一规则：此时不同步任何 scope，输出 ``Nothing was synced: <file>: <reason>. Fix the file, or move it aside and run `teamai init` to write a new one.`` 并以 exit 1 退出（加 `--silent` 时不输出，但仍以 exit 1 退出）；会话启动时不运行 pull，也不创建 agent 目录、不暂存包提示。`cwd` 已被删除的 hook（会话比它的 worktree 活得更久）沿用该会话最后记录的 scope，因此会话最后的事件和 skill 使用仍归属项目，分享提醒也遵循项目的设置，而不是 user scope 的。这需要本地事件日志中仍保留该会话之前的事件（压缩只保留活跃会话），且不适用于 Copilot，因为它的事件不记录目录。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
+> Project scope 默认与 user scope 隔离。当前工作目录包含 project scope 的 `.teamai/config.yaml` 时，`pull` 会处理该项目并跳过 user scope；仅当本地配置包含 `inheritUserScope: true` 时，才会先刷新安全的 user 资源通道。当前目录没有 project 配置时，`pull` 处理 user scope。project 模式下，user 的 `env`、MCP 定义、sources、reporting 和写入行为仍保持隔离。hooks 是唯一例外：project scope 的内置 hooks 会注入到你的 **HOME** 工具设置（`~/.claude/settings.json` 等），而非 `<projectRoot>`——因为它们依据传给 `hook-dispatch` 的 `cwd` 门控，且 `~/.claude` 恒存在、能通过「已安装工具」门槛（详见 Hooks 章节）。团队自己的 hooks（`hooks/hooks.yaml`）对 Claude Code 和 Codex 则写入主 checkout，不加门控（`<主 checkout>/.claude/settings.local.json`、`<主 checkout>/.codex/hooks.json`），项目的所有 worktree 共用一份。路径遵循项目的 `toolPaths`；Claude 在其配置的 settings 文件旁使用 `settings.local.json`。bare 仓库没有主 checkout，因此各 worktree 保留自己的副本；其他工具仍写在 HOME，仅在 `cwd` 位于该项目内时运行。在没有 teamai 配置的目录中（既没有 project 配置也没有 user scope），团队 hooks 不做任何事：不显示提醒，也不记录会话或 skill 使用；只运行机器级别的工作（CLI 更新检查、SessionStart 时的 pull、本地 agent，以及 pull 暂存的包提示）。对团队 hooks 和 skill 使用记录而言，存在但无法读取的 project 配置视为没有配置，而不会退回 user scope，也不会退回其后优先级更低的 project 配置（如旧的 `.teamai/config.yaml`）。`pull` 遵循同一规则：此时不同步任何 scope，输出 ``Nothing was synced: <file>: <reason>. Fix the file, or move it aside and run `teamai init` to write a new one.`` 并以 exit 1 退出（加 `--silent` 时不输出，但仍以 exit 1 退出）；会话启动时不运行 pull，也不创建 agent 目录、不暂存包提示。`cwd` 已被删除的 hook（会话比它的 worktree 活得更久）沿用该会话最后记录的 scope，因此会话最后的事件和 skill 使用仍归属项目，分享提醒也遵循项目的设置，而不是 user scope 的。这需要本地事件日志中仍保留该会话之前的事件（压缩只保留活跃会话），且不适用于 Copilot，因为它的事件不记录目录。self 单仓模式则把 hooks 保留在业务仓库里，随 clone 传播。
 
 启用角色化 skills 后，`pull` 的 skills 同步来源会变成 `skills/<namespace>/` 中的内容，按 `primaryRole + additionalRoles` 展开对应的 namespace，拍平安装到本地各 AI 工具 skills 目录。`rules/<namespace>/` 和 `claudemd/<namespace>/` 按 `knowledge` namespace 同步，`docs/<namespace>/` 在被声明后按 `docs` namespace 同步（见 [Docs（文档）](#docs文档)）；`agents/<namespace>/` 按角色的 `agents` namespace 同步（见 [Agents 资源类型](#agents-资源类型)）。`learnings/` 根目录对所有人共享，而 `learnings/<project-id>/` 子目录只对本目录激活的项目同步（见 [多项目](#多项目project-作为与-role-正交的维度)）。
 
@@ -923,13 +923,13 @@ teamai push
 
 > 管理员可在 `teamai.yaml` 中设置强制规则（`sharing.rules.enforced`），成员不可删除。
 
-大多数工具在自己的 rules 目录中为每条 rule 得到一个文件。Codex、`codex-internal` 和 `tcodex` 不读取 rules 目录（`.codex/rules/` 存放的是 Codex 自己的 `*.rules` 命令策略文件），因此 `pull` 不为它们写任何 rule 文件。user scope 下，团队 rule 写入该工具自己的 `AGENTS.md`（`~/.codex/AGENTS.md`、`~/.codex-internal/AGENTS.md`、`~/.tcodex/AGENTS.md`；`toolRoots` 条目可改变其位置）中的 `<!-- [teamai:team-rules:start] -->` 区块，只有该工具读取这个文件。在项目中，改由它们的 session-start hook 把项目的团队 rule 加入每个会话：项目 `AGENTS.md` 属于项目维护者，其他拥有自己 rules 格式的工具也会读取它。Hermes 的 `SOUL.md` 区块得到同样的内容。frontmatter 会被去掉，所以带 `paths:` 的 rule 在这里对所有文件生效，并以一行 `Applies to files matching: <globs>` 开头。Codex 在压缩上下文或 clear 之后会再次运行该 hook；恢复会话时不添加任何内容，因为会话中已包含这些 rule。Codex 启动的子 agent 通过 `SubagentStart` hook 获得它们。公开版 Codex 只在你于 `/hooks` 中批准新增或改动的 hook 后才运行它，在此之前不会得到项目的 rule。
+大多数工具在自己的 rules 目录中为每条 rule 得到一个文件。Codex、`codex-internal` 和 `tcodex` 不读取 rules 目录（`.codex/rules/` 存放的是 Codex 自己的 `*.rules` 命令策略文件），因此 `pull` 不为它们写任何 rule 文件。user scope 下，团队 rule 写入该工具自己的 `AGENTS.md`（`~/.codex/AGENTS.md`、`~/.codex-internal/AGENTS.md`、`~/.tcodex/AGENTS.md`；`toolRoots` 条目可改变其位置）中的 `<!-- [teamai:team-rules:start] -->` 区块，只有该工具读取这个文件。在项目中，改由它们的 session-start hook 把项目的团队 rule 加入每个会话：项目 `AGENTS.md` 属于项目维护者，其他拥有自己 rules 格式的工具也会读取它。Hermes 的 `SOUL.md` 区块得到同样的内容。frontmatter 会被去掉，所以带 `paths:` 的 rule 在这里对所有文件生效，并以一行 `Applies to files matching: <globs>` 开头。Codex 在压缩上下文或 clear 之后会再次运行该 hook；恢复会话时不添加任何内容，因为会话中已包含这些 rule。Codex 启动的子 agent 通过 `SubagentStart` hook 获得它们。公开版 Codex 只运行已信任的 hook。teamai 会自动信任它写入的 hooks；如果自动信任被禁用或失败，请在 `/hooks` 中批准它们以获得项目的 rule。
 
 culture、共享指令和 recall 区块采用同样的划分。user scope 下它们写入同一个 `AGENTS.md`，标记之外你自己的内容保持不变。在项目中，session-start hook 把它们与 rule 一起加入会话，`pull` 不改动项目 `AGENTS.md`。
 
 > 团队 `teamai.yaml` 中的 `toolPaths` 会整体替换内置默认值。设置了它的团队应为每个 Codex 系条目加上 `userScope.claudemd: .codex/AGENTS.md`（`.codex-internal/…`、`.tcodex/…`），用于 user scope 的 rule 和区块，并去掉其 `rules` 路径，因为 Codex 从不读取该目录。顶层的 `claudemd` 会把区块重新写进项目 `AGENTS.md`，所以不要设置。在项目中，hook 只需要该条目的 `settings` 路径，它安装在那里。`codex` 条目还需要 `mcpProject: .codex/config.toml`，项目的团队 MCP server 才会写入。
 
-> 从把 rule 复制到 `.codex/rules/` 的旧版本升级后，下一次 `pull` 会删除 teamai 投递到那里的 `.md` 副本，包括 `teamai-recall.md`。清理使用记录的 `toolRoots` 位置，同时检查发布者本地的无命名空间文件名及命名空间副本。你改过的副本会保留，并在警告中点名；`*.rules` 文件从不改动。团队此后已删除的 rule，其副本只有与记录的投递哈希一致时才会删除；没有该记录时也会保留并点名。同一次 pull 会为 `hooks.json` 中的 teamai hook 加上 `additionalContextLimit: 0` 和一个 `SubagentStart` 条目，因此公开版 Codex 会请你批准一次改动后的 hook。
+> 从把 rule 复制到 `.codex/rules/` 的旧版本升级后，下一次 `pull` 会删除 teamai 投递到那里的 `.md` 副本，包括 `teamai-recall.md`。清理使用记录的 `toolRoots` 位置，同时检查发布者本地的无命名空间文件名及命名空间副本。你改过的副本会保留，并在警告中点名；`*.rules` 文件从不改动。团队此后已删除的 rule，其副本只有与记录的投递哈希一致时才会删除；没有该记录时也会保留并点名。同一次 pull 会为 `hooks.json` 中的 teamai hook 加上 `additionalContextLimit: 0` 和一个 `SubagentStart` 条目，随后 teamai 会在公开版 Codex 中重新信任这些 hook（见 Hooks 章节）。
 
 ### Env、hooks 与 MCP server 按 namespace 划分
 
@@ -1177,7 +1177,7 @@ namespace 文件；只有当根文件未定义、而多个 namespace 文件都�
 | omp | `~/.omp/agent/mcp.json` | `<project>/.omp/mcp.json` |
 | pi | `~/.pi/agent/mcp.json` | `<project>/.pi/mcp.json` |
 
-Codex 只在受信任的项目中读取 `<project>/.codex/config.toml`。请在 Codex 询问时信任该项目，或在 `~/.codex/config.toml` 中加入 `[projects."<主 checkout 的真实路径>"]` 表并设置 `trust_level = "trusted"`；信任主 checkout 即覆盖该仓库的所有 worktree。项目未受信任、而其文件含有团队 server 时，`teamai doctor` 会报告。
+Codex 只在受信任的项目中读取 `<project>/.codex/config.toml`。写入团队 MCP servers 后，`teamai pull` 会自动信任主 checkout，除非设置了 `codexTrustEnabled: false`，或该项目已被明确标记为不信任。自动信任被禁用或失败时，可在 `~/.codex/config.toml` 中加入 `[projects."<主 checkout 的真实路径>"]` 表并设置 `trust_level = "trusted"`；信任主 checkout 即覆盖该仓库的所有 worktree。项目未受信任、而其文件含有团队 server 时，`teamai doctor` 会报告。
 
 
 CodeBuddy Code 的 [MCP 文档](https://www.codebuddy.cn/docs/cli/mcp)
@@ -1888,13 +1888,17 @@ teamai hooks remove    # 移除
 
 `hooks list` 按工具分别列出内置 hooks，因为各工具的集合并不相同：Copilot 额外有 `SessionEnd`，Claude Code、Codex、CodeBuddy 和 Qoder 额外有 `SubagentStop`，Codex 系工具还额外有 `SubagentStart`（为其启动的子 agent 提供项目的团队 rule 和指令），OMP 扩展覆盖四个事件且没有 `Skill` / `TodoWrite` matcher，OpenClaw 只映射 `SessionStart` + `UserPromptSubmit`，Hermes 只有 `SessionStart`。hook 注入流程不会为其安装任何内置 hook 的工具（如 JoyCode）不会列出；Kiro 也不列出——它的 `SessionStart` 由 agent 同步以 `hooks.agentSpawn` 形式内嵌，只存在于你实际同步过的 agent 中。
 
-inject 和 remove 只会操作你实际已安装的工具（即 `~/.<tool>/` 根目录已存在的工具）。对于 `toolPaths` 中已配置但未安装的工具，命令不会为其凭空创建根目录。
+inject 和 remove 只会操作你实际已安装的工具（即 `~/.<tool>/` 根目录已存在的工具）。对于 `toolPaths` 中已配置但未安装的工具，命令不会为其凭空创建根目录。HOME 和当前 worktree 的工具根目录缺失时，主 checkout 中现存的 Claude/Codex hook 文件也视为已安装的目标。inject 和 pull 会更新这些团队 hooks 并恢复 HOME 中的内置 hooks；remove 会清理主 checkout 中的托管 hooks，而不重建 HOME 根目录。
+
+Git hook 安装失败时，`hooks inject`、`init` 和单仓库自动初始化仍会尝试信任已经写入的 Codex hooks。注入保留安装错误，不显示整体成功。init 报告错误，并在完成本地设置时保持退出码 1，HTTP 初始化也如此。自动初始化在 debug 日志中记录该错误，然后继续本地设置。
+
+非-self 的 project scope 中，`hooks remove` 会移除 HOME 中当前 checkout 的门控团队 hooks，以及主 checkout 中 Claude/Codex 的团队 hooks。其他项目的门控团队 hooks 保留在 HOME；共享的内置 hooks 会被移除。
 
 在 Windows 上，经由 bash 执行的内置 hook 派发命令（如 Claude、Codex、Cursor、Copilot CLI）会以绝对路径引用 Git Bash——先查标准安装位置，再回退到 `HKLM\SOFTWARE\GitForWindows` 注册表——从而避免解析到 WSL 的 `bash.exe`；若找不到 Git Bash，则退回裸 `bash`。
 
 Cursor 也会加载 `~/.claude/settings.json`。Copilot CLI 会加载受信任项目里的 `.claude/settings.json`（self mode 把 hook 写在项目里；Copilot 不加载 `~/.claude/settings.json`）。只有另一边的 teamai hook 已经在磁盘上时，`hook-dispatch --tool claude` 才会退出：`~/.cursor/hooks.json` 或 `$CURSOR_PROJECT_DIR/.cursor/hooks.json` 含有 `--tool cursor`，或 `$COPILOT_PROJECT_DIR/.github/hooks/teamai.json` 含有 `--tool copilot`。写给 `claude` 的团队 hook 命令用同一判断。只启用了 Claude 时，Cursor 里这份 hook 照常运行，因为没有第二份可以接替。`COPILOT_CLI` 不能当信号：Copilot 会给每个子进程设置它，包括从它的 shell 里启动的 Claude。Claude Code 不会设置 `CURSOR_VERSION` 或 `COPILOT_PROJECT_DIR`。已经装好的团队 hook 需要再跑一次 `teamai pull` 或 `teamai hooks inject`，才会带上这个判断。
 
-> **Codex 信任门槛** — Codex（OpenAI / ChatGPT Codex 应用，工具 id 为 `codex`）对非托管 hooks 设有显式的用户信任机制。teamai 写入 `~/.codex/hooks.json` 后，对于新增或变更的 hook，Codex 可能会跳过执行，直到你在 `/hooks` 或 Settings → Hooks 中 review/trust。当检测到 Codex hooks 已安装时，`teamai hooks inject` 与 `teamai doctor` 会输出提示；teamai 从不修改 Codex 的 `[hooks.state]` 来自动信任 —— 信任操作交由你手动完成。
+> **Codex hook 信任** — Codex（OpenAI / ChatGPT Codex 应用，工具 id 为 `codex`）只运行已信任的非托管 hook，未信任或已变更的 hook 会被静默跳过；且只有项目被信任时才读取其 `.codex/`。因此每次写入 Codex hooks 文件后（`init`、每次 `pull`（含 SessionStart 触发的 pull）、`teamai hooks inject`），teamai 都会通过 `codex app-server` 信任它写入的那些 hook——与 Codex `/hooks` 信任提示调用的是同一接口。同一文件里你自己的 hook 不受影响，即使命令与团队 hook 相同。Codex 所有权记录包含事件、位置和完整生成条目，信任操作只选择对应的 Codex key。其他条目移动它的位置时，仅在完整定义唯一匹配时恢复所有权。旧 manifest 只记录事件、matcher 和命令，因此这些字段唯一匹配时，即使 hook 包含 `timeout` 或 `additionalContextLimit`，也可恢复所有权。对于 #370 之前的项目 Codex hooks，teamai 先从主 checkout 的 `.teamai/managed-hooks.json` 导入所有权，再用新 manifest 同步同一个文件；直接移除时也如此。没有所有权记录或无法区分的旧团队 hook 副本会保留。在项目中，当 Codex 需要从主 checkout 的 `.codex/` 读取 teamai 的 hooks 或 MCP servers 时，teamai 也会信任该主 checkout；bare 仓库则在当前 worktree 写入并信任。你在 Codex 中标记为不信任的项目保持不变，teamai 会提示。SessionStart 触发的 pull 写入的信任从下一个 Codex 会话起生效：当前会话已加载了它的 hooks。linked worktree 只有在存在 `.codex/` 目录时才读取主 checkout 的 `.codex/hooks.json`。post-checkout 准备步骤会为所选的 Codex 工具创建该目录，并在第一个会话之前完成 pull。跳过 checkout hooks 的宿主必须在启动 Codex 前完成准备。如果仅由 SessionStart 创建该目录，团队 hooks 从下一个 Codex 会话起加载；内置 hooks 位于 `~/.codex/hooks.json`，从第一个会话起就运行。若要自行信任，在 `config.yaml` 中设置 `codexTrustEnabled: false`。PATH 中没有 `codex` 或 app-server 失败时，`init` 和 `hooks inject` 会提示你在 `/hooks` 或 Settings → Hooks 中信任。交互式 pull 仅在 app-server 失败时警告，缺少 `codex` 时保持静默；silent pull 将结果记录在 debug 日志中。`teamai doctor` 会向 Codex 查询哪些 teamai hooks 不会运行并逐一列出。
 
 ### 团队 Hooks 声明
 
@@ -2215,7 +2219,7 @@ teamai remove rules <name> --force   # 跳过确认，用于脚本和 CI
 
 `MCP servers delivered to <tool>` 将团队 `mcp.yaml` 为该工具解析出的每个 server 与该工具自己配置文件中的条目逐一比对，并列出 reconcile 跳过的 server 及原因。比对的是条目内容而非名字：reconcile 不会覆盖不属于 teamai 的条目，因此你自己写的同名 server 会占住这个名字，团队的定义从未真正送达；过期的旧副本同样等于没送达。两者都报告为 `not the team's definition`，而覆盖非 teamai 写入的条目只有 `teamai pull --force` 能做到。未解析的 `${VAR}` 会在这里连同变量名一起报告——否则它只在 pull 时出现一次，之后再无提示。没有值的已声明密钥不算失败：doctor 把它作为备注打印（`--json` 中的 `notes`），并附上设置它的命令，退出码与没有它时相同；备注还会说明为它保留的条目可能含有旧值，以及某个 key 既声明为密钥、又在 `env.yaml` 中设置的情况。无法解析的 `mcp.yaml` 并不等于团队没有 MCP：它会作为 `Team MCP servers can be read` 连同解析错误一起报告，因为这种文件不会向任何工具注入内容，而且除第一次之外的每次运行都对此保持沉默。无法解析的团队 hooks 与团队模型配置（文件无法解析、同一文件内重复的名字，或两个活动 namespace 中的同名条目）会让 `Team hooks can be resolved` 与 `Team model profiles can be resolved` 失败，并给出 pull 只记录一次的原因；`teamai status` 把它们计为 0 时会指向这里。`Env variables injected in shell profile` 不再只查标记注释：它会检查 `env/env.yaml` 能否解析、以及是否在 `variables:` 键下声明了变量（写成普通的 `KEY: value` 映射等于没有声明；而显式写成 `variables: []` 属于没有内容要下发的配置，不会判为失败）、每个变量是否以 `env.yaml` 声明的值（或你为该团队设置的值；用 `--from-env` 设置的不会写入）写进了 `env.sh`（残留的旧值会一直被导出到每个 shell 和 MCP server，直到下次 pull；比对时会用生成器自身的逆运算读回 `env.sh`，因此跨多行引用的多行值能够正确匹配，而不会被误判为过期），以及本作用域注入的代码块（即 source 本作用域 `env.sh` 的那一块，因为同一个 profile 里还可能有其他作用域的代码块）是否真的能加载它——未加引号的 Windows 路径在 POSIX shell 中会被转义破坏，`source` 从不执行，而且没有任何提示。`No stale env blocks left behind` 是独立的一项检查：pull 优先选用哪个文件会随时间变化（Windows 上 Git Bash 的登录 shell 读取的是 `.bash_profile`/`.bash_login`/`.profile`，从不读取 `.bashrc`），而 pull 只会新增代码块，从不迁移旧的，因此早期安装或平台变化留下的失效代码块可能一直留在另一个候选文件里。它会列出每一个这样的文件（检查 `.zshrc`、`.bashrc`、`.bash_profile`、`.bash_login` 和 `.profile`，新旧写法都算），并指向 `teamai uninstall` 来清除它们——这与投递检查分开进行，因此不会因为还留着一个旧副本，就让一个正常工作的 env 代码块被判成故障。
 
-`Codex trusts this project, so it loads its team MCP servers` 在 project scope 下、项目的 `.codex/config.toml` 含有本 worktree 的 `managed-mcp.json` 为 Codex 记录的 server 时生成：Codex 只在受信任的项目中加载该文件，对未受信任的项目则静默跳过。它按 Codex 的方式读取 Codex 用户配置（`~/.codex/config.toml`，或 `toolRoots.codex` 下的那份）中的 `projects` 表：先取当前 checkout 的、设置了 `trust_level` 的 `projects."<dir>"` 条目，再取其主 checkout 的，均按真实路径（`/private/tmp/...` 而非 `/tmp/...`）。在该条目设置 `trust_level = "trusted"` 之前，它会失败，并指出文件及其中的 server；pull 结束时的检查也会报告这一失败。请在 Codex 询问时信任该项目，或自行为主 checkout 加上该条目，这样即覆盖所有 worktree。doctor 只读取该文件。
+`Codex trusts this project, so it loads its team MCP servers` 在 project scope 下、项目的 `.codex/config.toml` 含有本 worktree 的 `managed-mcp.json` 为 Codex 记录的 server 时生成：Codex 只在受信任的项目中加载该文件，对未受信任的项目则静默跳过。它按 Codex 的方式读取 Codex 用户配置（`~/.codex/config.toml`，或 `toolRoots.codex` 下的那份）中的 `projects` 表：先取当前 checkout 的、设置了 `trust_level` 的 `projects."<dir>"` 条目，再取其主 checkout 的，均按真实路径（`/private/tmp/...` 而非 `/tmp/...`）。在该条目设置 `trust_level = "trusted"` 之前，它会失败，并指出文件及其中的 server；pull 结束时的检查也会报告这一失败。pull 尝试自动信任后，如果该检查仍失败，请在 Codex 中修改项目信任，或自行为主 checkout 加上该条目，这样即覆盖所有 worktree。doctor 只读取该文件。
 
 `Contributed learnings are published` 会在 `teamai contribute` 写下、但尚未推送成功的笔记仍在队列中时失败。当本次 pull 已经说过时，手动 `teamai pull` 结束时不会再重复它：pull 会尝试发布队列并自行报告结果，还会带上导致失败的推送错误——这是该检查本身给不出的信息。如果 pull 因为团队仓库刷新失败而根本没走到那一步，该检查会照常打印。
 
@@ -2236,7 +2240,7 @@ teamai remove rules <name> --force   # 跳过确认，用于脚本和 CI
 }
 ```
 
-尚未初始化时 `scope` 为 `null`。仅当团队仓库声明了 packages 时才会出现 `packages` 字段，内容是已渲染的报告行；`notes` 只在有额外提示时出现：上文所述的 namespace 提示（替换了根目录条目的条目，或未配置角色或项目时重复定义的名字），以及 Codex 信任门槛提醒。
+尚未初始化时 `scope` 为 `null`。仅当团队仓库声明了 packages 时才会出现 `packages` 字段，内容是已渲染的报告行；`notes` 只在有额外提示时出现：上文所述的 namespace 提示（替换了根目录条目的条目，或未配置角色或项目时重复定义的名字），以及无法查询 Codex 时（PATH 中没有 `codex`，或其 app-server 失败）的 Codex hook 信任提醒。
 
 自动更新在 Stop hook 中执行，可通过两层控制：
 
@@ -2534,6 +2538,7 @@ projectRoot: /path/to/project  # 仅 project scope
 inheritUserScope: true         # 可选，仅 project scope，默认 false
 coAuthorEnabled: true          # 可选，每机器的 co-author 覆盖
 contributeHintEnabled: false   # 可选，每机器覆盖 sharing.contributeHint.enabled
+codexTrustEnabled: false       # 可选，每机器，停止 teamai 信任它写入的 Codex hooks 与项目（见 Hooks）
 toolRoots:                     # 可选，每机器的工具根目录（见下）
   claude: ~/.claude-work
   codex: ~/.codex-alt
@@ -2541,7 +2546,7 @@ toolRoots:                     # 可选，每机器的工具根目录（见下�
 
 #### 迁移后的工具根目录（`toolRoots`）
 
-有的工具可以把自己的配置放到别处——Claude Code 通过 `CLAUDE_CONFIG_DIR`、Codex 通过 `CODEX_HOME` 这样做——此时 teamai 按团队默认位置写入的内容它一概读不到。`toolRoots` 用与 `toolPaths` 相同的工具 id 指明该工具实际使用的目录，teamai 为它解析的所有路径（skills、rules、agents、`CLAUDE.md`、settings 与 hook、用户级 MCP 配置，以及 Codex 写在 `config.toml` 里的 co-author 设置）都会一并迁过去。其他工具不受影响，project scope 的路径也不受影响：那些路径挂在项目根目录下，每机器的根目录对它们没有意义。hook 是个例外，也正是值得记录 `toolRoots` 的原因——即使在 project scope，hook 也注入到 home 目录，因此两种 scope 下都跟随 `toolRoots`。
+有的工具可以把自己的配置放到别处——Claude Code 通过 `CLAUDE_CONFIG_DIR`、Codex 通过 `CODEX_HOME` 这样做——此时 teamai 按团队默认位置写入的内容它一概读不到。`toolRoots` 用与 `toolPaths` 相同的工具 id 指明该工具实际使用的目录，teamai 为它解析的所有路径（skills、rules、agents、`CLAUDE.md`、settings 与 hook、用户级 MCP 配置，以及 Codex 写在 `config.toml` 里的 co-author 设置）都会一并迁过去。其他工具不受影响，project scope 的路径也不受影响：那些路径挂在项目根目录下，每机器的根目录对它们没有意义。hook 是个例外，也正是值得记录 `toolRoots` 的原因——即使在 project scope，内置 hook 也注入到 home 目录，因此两种 scope 下都跟随 `toolRoots`，teamai 也在 `toolRoots.codex` 下的 `config.toml` 中信任 Codex hooks。
 
 `teamai init` 会自动写入：只要设置了 `CLAUDE_CONFIG_DIR` 或 `CODEX_HOME`，init 就记录它指向的目录（`toolRoots.claude`、`toolRoots.codex`）并打印出来。`CLAUDE_CONFIG_DIR=~/.claude` 也算——它与不设置该变量并不等价：设置之后 Claude Code 从配置目录内部读取 `.claude.json`，因此 teamai 写的是 `~/.claude/.claude.json` 而不是 `~/.claude.json`。读取这些变量的命令也只有 `init`——它们只存在于某一份 shell 配置里，而 teamai 还会从 session hook 和别的终端里运行，每次运行都去读它，同步目标就会取决于是谁启动了进程。重新执行 `init` 会保留之前记录的根目录，所以在没有该变量的 shell 里再跑一次 init，同步目标不会被悄悄改回默认位置。如果重新执行 `init` 确实换了根目录，teamai 会把此前注入到旧根目录设置文件（`settings.json`，Codex 为 `hooks.json`）里的 hook 移除，以免那个工具继续往新目录同步；写在旧目录里的 skills、rules 和指令文件会原样保留，并在输出中指明位置。project scope 的 `init` 若自身没有记录、也读不到该变量，则沿用 user scope 的记录：根目录是这台机器的事实，而 project scope 的 hook 也注入到 home 目录。要结束迁移，把该变量设为空再执行一次 `init`（`CLAUDE_CONFIG_DIR= teamai init …`、`CODEX_HOME= teamai init …`）：记录会被清除，旧根目录按同样方式释放。除 hook 之外，旧根目录里 teamai 管理的 MCP server，以及（Claude Code 的）本地 agent 下发的网关凭据也会一并移除——它们是生效中的配置，不同于 skills 和 rules。
 
@@ -2755,7 +2760,7 @@ teamai init --repo https://github.com/yourorg/yourrepo --scope user --role <role
 
 **Q: User scope 和 Project scope 可以共存吗？**
 
-可以，但 project scope 默认保持隔离。当前工作目录包含 project scope 配置时，该项目生效并跳过 user scope。先初始化 user scope，再使用 `--inherit-user-scope` 初始化项目（或在项目本地配置中设置 `inheritUserScope: true`），即可组合安全资源和 Recall 结果；可执行配置和控制面配置（`env`、MCP）仍只使用 project scope；hooks 例外——非-self 的 project scope 会把 hooks 注入到 HOME，以便 `hook-dispatch` 依据 `cwd` 门控（详见 Hooks 章节）。
+可以，但 project scope 默认保持隔离。当前工作目录包含 project scope 配置时，该项目生效并跳过 user scope。先初始化 user scope，再使用 `--inherit-user-scope` 初始化项目（或在项目本地配置中设置 `inheritUserScope: true`），即可组合安全资源和 Recall 结果；可执行配置和控制面配置（`env`、MCP）仍只使用 project scope；hooks 例外——非-self 的 project scope 会把内置 hooks 注入到 HOME，以便 `hook-dispatch` 依据 `cwd` 门控（详见 Hooks 章节）。
 
 **Q: `teamai init` 提示已初始化？**
 
