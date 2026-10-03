@@ -8,6 +8,7 @@ import YAML from 'yaml';
 import {
   migrateV1ToV2,
   loadUserVotes,
+  readUserVotes,
   saveUserVotes,
   incrementRecalled,
   incrementUpvoted,
@@ -98,6 +99,43 @@ describe('loadUserVotes', () => {
     const result = await loadUserVotes(filePath);
     expect(result.version).toBe(2);
     expect(Object.keys(result.votes)).toHaveLength(0);
+  });
+});
+
+describe('readUserVotes', () => {
+  it('migrates a v1 file in memory and leaves it untouched on disk', async () => {
+    const v1: UserVotes = { votes: { 'doc-x': { at: '2026-06-01T00:00:00Z' } } };
+    const filePath = path.join(tmpDir, 'user.yaml');
+    fs.writeFileSync(filePath, YAML.stringify(v1));
+    const before = fs.readFileSync(filePath, 'utf-8');
+
+    const result = await readUserVotes(filePath);
+    expect(result.version).toBe(2);
+    expect(result.votes['doc-x'].recalled_count).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(before);
+  });
+
+  it('reads a v2 file the same way loadUserVotes does', async () => {
+    const v2: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-y': { recalled_count: 3, upvoted_count: 1, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: { 'doc-y': { recalled_delta: 1, upvoted_delta: 0 } },
+    };
+    const filePath = path.join(tmpDir, 'user.yaml');
+    fs.writeFileSync(filePath, YAML.stringify(v2));
+
+    expect(await readUserVotes(filePath)).toEqual(await loadUserVotes(filePath));
+  });
+
+  it('returns empty v2 for a missing or corrupt file, creating nothing', async () => {
+    const missing = path.join(tmpDir, 'nonexistent.yaml');
+    expect((await readUserVotes(missing)).version).toBe(2);
+    expect(fs.existsSync(missing)).toBe(false);
+
+    const corrupt = path.join(tmpDir, 'corrupt.yaml');
+    fs.writeFileSync(corrupt, '{{{{ not yaml }}}}');
+    expect(Object.keys((await readUserVotes(corrupt)).votes)).toHaveLength(0);
+    expect(fs.readFileSync(corrupt, 'utf-8')).toBe('{{{{ not yaml }}}}');
   });
 });
 

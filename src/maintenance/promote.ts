@@ -248,7 +248,7 @@ async function aggregatePerDocVotes(
   votesDir: string,
 ): Promise<Map<string, { recalled: number; upvoted: number; users: Set<string> }>> {
   const perDoc = new Map<string, { recalled: number; upvoted: number; users: Set<string> }>();
-  const { loadUserVotes } = await import('../votes.js');
+  const { readUserVotes } = await import('../votes.js');
   const voteFiles = await listFiles(votesDir);
 
   for (const file of voteFiles) {
@@ -257,7 +257,7 @@ async function aggregatePerDocVotes(
     const filePath = path.join(votesDir, file);
 
     try {
-      const data = await loadUserVotes(filePath);
+      const data = await readUserVotes(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = perDoc.get(docId) ?? { recalled: 0, upvoted: 0, users: new Set<string>() };
         existing.recalled += entry.recalled_count ?? 0;
