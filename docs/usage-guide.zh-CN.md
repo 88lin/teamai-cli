@@ -157,9 +157,51 @@ teamai init https://github.com/yourorg/yourrepo
 `teamai pull` 会向它完整同步一次，即使团队仓库自另一个检出 pull 之后并未变化。worktree 尚未 pull 过时，
 若 `teamai push` 发现与团队仓库不同的团队 rule 或 skill 就会停止，因为无法区分队友的更新和你的修改。
 `teamai pull` 会覆盖这些文件：如有修改，请先另存一份，再在该 worktree 中执行 `teamai pull`，放回修改后重新 push。各 Agent 的项目根目录
-（`.claude/`、`.cursor/`、`.codebuddy/` 等）仍在工作区内、于 **SessionStart** 时按刚打开的
-工具创建。例如，打开 Claude Code 时会创建 `.claude/`，再由 pull 写入。单独执行 `teamai pull`
-仍会跳过项目里还不存在根目录的工具，因此不会给尚未在本项目打开过的 Agent 凭空建目录。
+（`.claude/`、`.cursor/`、`.codebuddy/` 等）仍在工作区内创建。`teamai init` 会为你选择的每个工具
+创建根目录，并在结束时执行一次 pull 将其填充：用 `--agent <tool>` 指定工具；或在终端中不带 `--agent`
+运行时，从与单仓库模式相同的选择器中勾选（第 1 项 **Auto** 为你 home 目录下已安装的工具，也是回车默认项）。
+所选工具会追加到 `enabledAgents`，因此重新执行只会新增工具，不会丢掉之前的选择。否则由 **SessionStart** 按刚打开的
+工具创建：打开 Claude Code 时会创建 `.claude/`，再由 pull 写入。单独执行 `teamai pull`，以及非交互且不带
+`--agent` 的 `init`，仍会跳过项目里还不存在根目录的工具，因此不会给尚未在本项目选择或打开过的 Agent 凭空建目录。
+
+新 worktree 不必等到第一次会话。在项目 scope 下，`teamai init` 与 `teamai pull` 会在仓库的本地
+git 配置中安装一个 git hook，所有 worktree 共用：`hook.teamai-post-checkout` 与
+`hook.teamai-post-merge`（需要 Git 2.54 或更高版本）。Git 会在任何
+`core.hooksPath` hook 管理器和 `.git/hooks` 脚本之外一并运行它。当 `git worktree add`，或运行相同
+checkout hook 的应用，新建一个检出时，该 hook 会创建 `enabledAgents` 的项目根目录（为空时，取主检出已有的根目录），
+并在命令返回前向该 worktree 执行 pull，因此其中的第一次会话就已具备团队的 skill、rule 与 MCP 服务器。
+团队仓库克隆若在 24 小时内 fetch 过，这次 pull 直接读取它（否则先 fetch），订阅的 source 读取其缓存克隆；
+随后在后台运行一次完整的 `teamai pull --silent`，fetch 团队仓库、source、learnings 与 reports。
+切换分支不会触发任何操作。跳过 checkout hook 的宿主需要在 AI 工具启动前完成 `teamai pull` 的准备步骤。
+Codex CLI 0.160.0 请先用 `git worktree add` 创建检出，在其中执行 `teamai pull`，再用
+`codex exec -C <worktree>` 启动；原生 `codex exec --worktree` 路径会跳过 `post-checkout`。
+`git pull` 之后（`post-merge`），该 hook 会 fetch 团队仓库（最多等待 5 秒），
+并在 `git pull` 返回前交付其变更；超过 5 秒时，以及 source、learnings 与 reports，交给同样的后台 pull。
+单仓库模式下，它交付 `git pull` 刚带来的知识，不访问网络。该 hook 不输出任何内容且始终以 0 退出，
+因此 pull 失败也不会让 git 命令失败。hook 内的失败（团队仓库 fetch 失败，或在 5 秒上限处被中止而后台 pull
+也未完成；另一个 teamai 进程持有项目的同步锁，超过 hook 的等待时间：`git pull` 之后 5 秒（包括单仓库模式），新 worktree 60 秒；资源、hook 或 MCP 未完整交付）
+会写入 `~/.teamai/debug.log` 并被记录：`teamai doctor` 会指出它及其修复方法，每次交互式 `teamai pull`
+都会提示，直到某次完成为止。后台 pull 会重试，只有所有启动交付阶段都成功后，hook pull 或交互式 pull 才会清除该记录。`teamai doctor` 还会报告 hook
+是否已安装，未安装时说明原因。它遵循下文的 scope 规则：没有项目配置，或项目配置无法读取，
+都不会同步；无法读取配置的原因保留在 `~/.teamai/debug.log` 中。其命令是一行 `sh`，带着 Git 传入的参数运行 `teamai hook-dispatch <event> --tool git`，
+与 Agent hook 一样通过 `~/.teamai/bin` 找到 `teamai`。
+
+Git 低于 2.54 且未设置 `core.hooksPath` 时，teamai 改为在 `.git/hooks/post-checkout` 与
+`.git/hooks/post-merge` 的 shebang 之后插入一段位于 `# >>> teamai git hook` 与 `# <<< teamai git hook <<<`
+标记之间的代码块（脚本不存在时会创建），脚本的其他行保持不变。该代码块运行同一条命令，不输出任何内容，
+也不改变脚本的退出码。设置了 `core.hooksPath`（hook 管理器），或 hook 脚本是符号链接或不是可执行的 shell 脚本时，teamai
+不写入任何内容，`teamai doctor` 会建议：将 Git 升级到 2.54 或更高版本；或者，如果团队同意提交它，在管理器定义的
+post-checkout 与 post-merge hook 中运行
+`command -v teamai >/dev/null 2>&1 && teamai hook-dispatch <event> --tool git "$@" >/dev/null 2>&1 || true`
+（`<event>` 分别为 `post-checkout` 与 `post-merge`），管理器的配置不是 shell 脚本时用 `sh -c '...'` 包裹。
+在没有 teamai 的机器上，这一行什么也不做。
+已有 hook 的内容和权限保持不变。读取或写入 hook 失败时，`init` 与 `hooks inject` 会传播该错误；
+由 Git 启动的 pull 会记录错误，下一次 `teamai pull` 会重试。
+
+Git 升级到 2.54 或更高版本后，下一次 `teamai pull` 会安装配置 hook 并移除该代码块，避免 hook 运行两次。
+`teamai pull --dry-run` 会说明是否将安装或更新该 hook，但不写入任何内容。在项目中运行 `teamai uninstall`
+会移除 `hook.teamai-post-checkout` 与 `hook.teamai-post-merge` 条目以及带标记的代码块；其他 hook 和脚本行保持不变。
+移除后只剩 shebang 的脚本是 teamai 创建的，会被删除。
 
 > **从旧版 teamai 升级？** 升级后首次执行 `teamai init` / `pull` / `push` / `contribute`
 > （或 `import --from-mr`）会自动把已有的
@@ -571,7 +613,7 @@ teamai skill path wiki              # 打印打包目录，用于运行 skill �
 
 ### 自动同步
 
-`teamai init` 时已注入 Hooks 到你的 AI 工具中。**每次启动 AI 会话时会自动执行 `teamai pull`**，无需手动操作。在 project scope 下，该 SessionStart hook 会先为当前 Agent 创建项目根目录（例如用 Claude Code 打开仓库时创建 `<project>/.claude`），然后再 pull。
+`teamai init` 时已注入 Hooks 到你的 AI 工具中，并在结束时执行了一次 pull，因此你的第一个会话就已拥有团队的 skill、rule 和 MCP server。**每次启动 AI 会话时会自动执行 `teamai pull`**，无需手动操作。在 project scope 下，该 SessionStart hook 会先为当前 Agent 创建项目根目录（例如用 Claude Code 打开仓库时创建 `<project>/.claude`），然后再 pull。
 
 *(注：会话启动自动同步依赖工具的生命周期 Hooks 支持，如 [CC]、Codex、GitHub Copilot CLI、Cursor、CodeBuddy、WorkBuddy、Qoder、Kiro、OpenCode、Oh My Pi、Pi、Hermes、OpenClaw 等。Kiro 仅在交互式 CLI 会话激活由 TeamAI 渲染的自定义 agent 时触发该 Hook；其内存中的内置默认 agent 无法写入，非交互模式也不会触发 `agentSpawn`。对于暂无 teamai 可写入 Hooks 的工具（如 JoyCode、Gemini CLI 等），需手动执行 `teamai pull`。)*
 
@@ -2676,6 +2718,7 @@ teamai uninstall --agent claude
 - 团队同步的 rules，包括旧版本留在 `.codex/rules/` 中的副本，团队此后已删除的 rule 的副本也包括在内。清理使用记录的 `toolRoots` 位置和发布者本地的文件名。其中你改过的副本会保留，并在警告中点名。已删除 rule 的副本只有与记录的投递哈希一致时才会删除；没有该记录时也会保留并点名。Codex 的 `*.rules` 文件保留
 - 团队同步的自定义 agents 和 CLI 内置 agents（保留用户自建 agents）
 - Shell profile 中的 env 块——会清理每一个候选文件（`.zshrc`、`.bashrc`、`.bash_profile`、`.bash_login`、`.profile`）中、代码块指向本作用域自身 `env.sh` 的那些，而不仅仅是当前 `pull` 会选中的那一个；指向其他作用域 `env.sh` 的代码块不受影响
+- 项目中 teamai 的 git hook：仓库 git 配置中的 `hook.teamai-post-checkout` 与 `hook.teamai-post-merge` 条目，以及 `.git/hooks/post-checkout` 与 `post-merge` 中带标记的代码块（移除后只剩 shebang 的脚本是 teamai 创建的，会被删除）。其他 hook 保留
 - `~/.teamai/` 目录
 
 ### 只卸载单个工具（`--agent <tool>`）
@@ -2700,7 +2743,6 @@ teamai uninstall --agent claude
 
 ```bash
 teamai init --repo https://github.com/yourorg/yourrepo --scope user --role <role_id> --force
-teamai pull
 ```
 
 ---
@@ -2721,7 +2763,7 @@ teamai init --repo https://github.com/yourorg/yourrepo --force
 
 **Q: 在项目里执行 `teamai init` 后没有 `.claude/`（或 `.cursor/`、`.codebuddy/`）目录？**
 
-对内置工具而言这是预期行为：`init` 不知道你会打开哪个 Agent。在项目中打开 Claude Code / Cursor / CodeBuddy：SessionStart hook 会创建该工具的项目根目录并随后 pull。单独执行 `teamai pull` 不会为缺失的 Agent 根目录建目录。例外是仅在 `teamai.yaml` 的 `toolPaths` 中定义的自定义 Agent（不属于内置工具）——`init --agent <id>` 会自行创建该 Agent 的根目录，因为没有其他流程会为它创建。这仅在 git 模式的 init（默认或 `--self`）下生效：HTTP init（`--http`）不会在本地克隆 `teamai.yaml`，因此没有自定义路径可供创建，只会为已安装的内置工具创建根目录。
+对内置工具而言，`init` 未带 `--agent` 且没有终端（不弹选择器）时这是预期行为：它不知道你会打开哪个 Agent。执行 `teamai init <repo> --agent claude`（或 `cursor`、`codebuddy` 等）会在 init 结束前创建该工具的根目录并填充；或者在项目中打开该工具：SessionStart hook 会创建该工具的项目根目录并随后 pull。单独执行 `teamai pull` 不会为缺失的 Agent 根目录建目录。例外是仅在 `teamai.yaml` 的 `toolPaths` 中定义的自定义 Agent（不属于内置工具）——`init --agent <id>` 会自行创建该 Agent 的根目录，因为没有其他流程会为它创建。这仅在 git 模式的 init（默认或 `--self`）下生效：HTTP init（`--http`）不会在本地克隆 `teamai.yaml`，因此没有自定义路径可供创建，只会为已安装的内置工具创建根目录。
 
 **Q: Hooks 没有自动触发？**
 

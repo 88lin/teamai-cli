@@ -162,10 +162,72 @@ there stops if it finds a team rule or skill that differs from the team repo, si
 cannot tell a teammate's update from your edit. `teamai pull` replaces those files, so
 copy any you edited somewhere safe, pull, put your edits back and push again. Per-agent
 project roots (`.claude/`, `.cursor/`, `.codebuddy/`, …) are still created inside the
-workspace on **SessionStart** for the tool that just opened. For example, opening
-Claude Code creates `.claude/`, then pull writes into it. A bare `teamai pull` still
-skips tools whose project root does not exist, so it never invents agent directories
-for tools you have not opened in this project.
+workspace. `teamai init` creates the root of each tool you choose, then ends with a
+pull that fills it: name the tools with `--agent <tool>`, or, in a terminal without
+`--agent`, pick them from the same picker single-repo mode uses (option 1, **Auto**,
+is the tools installed under your home dir and the Enter default). The choice is
+added to `enabledAgents`, so a re-run adds tools without dropping earlier ones.
+Otherwise **SessionStart** creates the root of the tool that just opened: opening
+Claude Code creates `.claude/`, then pull writes into it. A bare `teamai pull`, and a
+non-interactive `init` without `--agent`, still skip tools whose project root does
+not exist, so they never invent agent directories for tools you have not
+chosen or opened in this project.
+
+A new worktree does not wait for that first session. In project scope, `teamai init`
+and `teamai pull` install a git hook in the repository's local git config, shared by
+every worktree: `hook.teamai-post-checkout` and `hook.teamai-post-merge` (Git 2.54 or
+later). Git runs it beside any `core.hooksPath` hook
+manager and any `.git/hooks` script. When `git worktree add`, or an app that runs
+the same checkout hooks, makes a new checkout, the hook creates the project roots of
+`enabledAgents` (when that is empty, the roots the main checkout has) and pulls into
+the worktree before the command returns, so the first session there already has the
+team's skills, rules and MCP servers. That pull reads the team clone as it is when it
+was fetched in the last 24 hours (and fetches it first otherwise), and subscribed
+sources from their cached clones; a full `teamai pull --silent` then runs in the
+background to fetch the team repo, sources, learnings and reports. A branch switch does nothing.
+Hosts that skip checkout hooks need a setup step that finishes `teamai pull` before
+the AI tool starts. For Codex CLI 0.160.0, create the checkout with `git worktree add`, run
+`teamai pull` there, then launch `codex exec -C <worktree>`; its native
+`codex exec --worktree` path skips `post-checkout`.
+After `git pull` (`post-merge`), the hook fetches the team repo, waiting at most 5 seconds,
+and delivers its changes before `git pull` returns; past 5 seconds, and for sources,
+learnings and reports, the same background pull takes over. In single-repo mode it
+delivers the knowledge `git pull` just brought, with no network. The hook prints nothing and always exits 0, so a failed pull never
+fails the git command. A failure inside it (the team repo fetch failed, or stopped at the
+5-second cap and the background pull did not finish it; another teamai process held the
+project's sync lock longer than the hook waits, 5 seconds after `git pull` (including
+single-repo mode) and 60 seconds for a new worktree; incomplete resource, hook or MCP
+delivery) is written to `~/.teamai/debug.log` and recorded: `teamai doctor`
+names it with its fix, and each interactive `teamai pull` mentions it until one completes. The
+background pull retries, and a hook or interactive pull clears the record only after all startup delivery
+stages succeed. `teamai doctor`
+also reports whether the hook is installed and, when it is not, why. It follows the scope rules below: no project config, or one
+that cannot be read, means no sync; an unreadable config's reason is kept in
+`~/.teamai/debug.log`. The command is one `sh` line that runs
+`teamai hook-dispatch <event> --tool git` with Git's arguments, finding `teamai`
+through `~/.teamai/bin` as the agent hooks do.
+
+With Git older than 2.54 and no `core.hooksPath`, teamai instead adds a block between
+`# >>> teamai git hook` and `# <<< teamai git hook <<<` markers to `.git/hooks/post-checkout`
+and `.git/hooks/post-merge`, right after the shebang, creating the script when there is
+none; the script's other lines are kept. The block runs the same command, silently, and
+does not change the script's exit status. With `core.hooksPath` set (a hook manager), or
+a hook script that is a symlink or not an executable shell script, teamai writes nothing, and `teamai doctor`
+advises: upgrade Git to 2.54 or later; or, if the team agrees to commit it, run
+`command -v teamai >/dev/null 2>&1 && teamai hook-dispatch <event> --tool git "$@" >/dev/null 2>&1 || true`
+from the post-checkout and post-merge hooks your manager defines (with `post-checkout` or
+`post-merge` as `<event>`), wrapped in `sh -c '...'` when its config is not a shell script.
+That line does nothing on a machine without teamai.
+Existing hook contents and permissions are preserved. Reading or writing a hook can
+fail: `init` and `hooks inject` propagate that error; a Git-started pull records it
+and the next `teamai pull` retries.
+
+Once Git is 2.54 or later, the next `teamai pull` installs the config hook and takes the
+block out, so the hook does not run twice. `teamai pull --dry-run` says when it would
+install or update the hook and writes nothing. `teamai uninstall` in the project removes
+the `hook.teamai-post-checkout` and `hook.teamai-post-merge` entries and the marked
+blocks; other hooks and script lines stay. A script left with only its shebang is the
+one teamai created, and is deleted.
 
 > **Upgrading from an older teamai?** The first `teamai init` / `pull` / `push` /
 > `contribute` (or `import --from-mr`) after upgrading automatically migrates an existing `<repo>/.teamai/` into the partition
@@ -645,7 +707,7 @@ resolve: `teamai skill get team-wiki-codebase` serves `wiki`.
 
 ### Auto-sync
 
-`teamai init` already injected Hooks into your AI tools. **`teamai pull` runs automatically every time you start an AI session** — no manual action needed. In project scope, that SessionStart hook first creates the current agent's project root (e.g. `<project>/.claude` when Claude Code opens the repo) if it is missing, then pulls.
+`teamai init` already injected Hooks into your AI tools and ended with a pull, so your first session has the team's skills, rules and MCP servers. **`teamai pull` runs automatically every time you start an AI session** — no manual action needed. In project scope, that SessionStart hook first creates the current agent's project root (e.g. `<project>/.claude` when Claude Code opens the repo) if it is missing, then pulls.
 
 *(Note: Automatic sync on session start requires an agent that supports lifecycle hooks, such as [CC], Codex, GitHub Copilot CLI, Cursor, CodeBuddy, WorkBuddy, Qoder, Kiro, OpenCode, Oh My Pi, Pi, Hermes, or OpenClaw. Kiro runs the hook when a TeamAI-rendered custom agent is activated in an interactive CLI session; its in-memory built-in default agent is not writable, and non-interactive mode does not fire `agentSpawn`. For tools without a teamai-writable hooks surface such as JoyCode or Gemini CLI, run `teamai pull` manually.)*
 
@@ -2865,6 +2927,7 @@ What gets removed:
 - Team-synced rules, including the copies older releases left in `.codex/rules/`, also of rules the team has since removed. Cleanup follows the recorded `toolRoots` location and the publisher's local filenames. A copy there you edited is kept and named in a warning. A removed rule's copy is deleted only if it matches its recorded delivery hash; without that record, it is kept and named too. Codex's `*.rules` files are kept
 - Team-synced custom agents and CLI built-in agents (your own agents are preserved)
 - The env block in your shell profile — every candidate file (`.zshrc`, `.bashrc`, `.bash_profile`, `.bash_login`, `.profile`) carrying a block that sources this scope's own `env.sh` is cleaned, not only the one file `pull` would choose today; a block sourcing a different scope's `env.sh` is left alone
+- In a project, teamai's git hook: the `hook.teamai-post-checkout` and `hook.teamai-post-merge` entries in the repository's git config, and the marked block in `.git/hooks/post-checkout` and `post-merge` (a script left with only its shebang, the one teamai created, is deleted). Other hooks are kept
 - The `~/.teamai/` directory
 
 ### Uninstall a single tool (`--agent <tool>`)
@@ -2889,7 +2952,6 @@ To rejoin after uninstalling:
 
 ```bash
 teamai init --repo https://github.com/yourorg/yourrepo --scope user --role <role_id> --force
-teamai pull
 ```
 
 ---
@@ -2910,7 +2972,7 @@ teamai init --repo https://github.com/yourorg/yourrepo --force
 
 **Q: After `teamai init` in a project, there is no `.claude/` (or `.cursor/`, `.codebuddy/`) directory?**
 
-That is expected for a built-in tool: `init` does not know which agent you will open. Open Claude Code / Cursor / CodeBuddy in the project: the SessionStart hook creates that tool's project root and then pulls. A bare `teamai pull` will not create missing agent roots. The exception is a custom agent defined only in `teamai.yaml`'s `toolPaths` (not one of the built-in tools) — `init --agent <id>` creates that agent's root itself, since nothing else ever would. This only works for git-backed init (default or `--self`): an HTTP init (`--http`) never clones a local `teamai.yaml`, so it has no custom paths to seed from and only ever creates roots for built-in tools that are already installed.
+That is expected for a built-in tool when `init` ran without `--agent` and without a terminal (no picker): it does not know which agent you will open. Run `teamai init <repo> --agent claude` (or `cursor`, `codebuddy`, …) to create that tool's root and fill it before init exits, or open the tool in the project: the SessionStart hook creates that tool's project root and then pulls. A bare `teamai pull` will not create missing agent roots. The exception is a custom agent defined only in `teamai.yaml`'s `toolPaths` (not one of the built-in tools) — `init --agent <id>` creates that agent's root itself, since nothing else ever would. This only works for git-backed init (default or `--self`): an HTTP init (`--http`) never clones a local `teamai.yaml`, so it has no custom paths to seed from and only ever creates roots for built-in tools that are already installed.
 
 **Q: Hooks aren't firing automatically?**
 
