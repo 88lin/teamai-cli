@@ -627,7 +627,7 @@ teamai pull --dry-run    # 试运行，不实际修改
 
 没有 `--dry-run` 预览的命令（如 `teamai init`、`teamai hooks remove`、`teamai models add` / `configure` / `remove`、`teamai bind-project` 和 `teamai codebase --extract`）会拒绝该参数：打印 `teamai <command> has no --dry-run preview, nothing was run` 并以退出码 1 结束。
 
-在 #971 合并前，`remove`、`roles init/add/remove/update`、`projects add/update/remove` 和 `import --from-repo/--from-repo-list` 也拒绝 `--dry-run`；在 #970 合并前，`stats` 和 `recall <query>` 拒绝该参数。`digest`、`import --from-claude` 和 `import --from-iwiki` 尚无安全预览，也拒绝该参数。`import --from-org`、`--from-mr`、`--dir` 和 `recall feedback` 的预览仍可使用。后合并的 PR 必须恢复已修复命令的 guard 分类。
+在 #971 合并前，`remove`、`roles init/add/remove/update`、`projects add/update/remove` 和 `import --from-repo/--from-repo-list` 也拒绝 `--dry-run`。`digest`、`import --from-claude` 和 `import --from-iwiki` 尚无安全预览，也拒绝该参数。`stats`、`recall <query>`、`import --from-org`、`--from-mr`、`--dir` 和 `recall feedback` 的预览均可使用。
 
 手动执行 `teamai pull` 会在结束时运行 `teamai doctor` 的检查，并逐条打印失败项及其修复建议——包括它刚刚报告同步的 skill 是否真的落到每个启用工具的磁盘上、且可被读取。全部通过时不会有任何额外输出，退出码也不变。SessionStart hook 路径和 `--dry-run` 完全不运行检查，会话启动速度保持不变。托管平台相关的检查（`gh`/`gf` 认证）留给 `teamai doctor`：这次 pull 刚刚用过该平台。
 

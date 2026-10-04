@@ -178,7 +178,7 @@ describe('--dry-run on a command with no preview', () => {
   });
 
   it.each([
-    ['stats'], ['digest'], ['recall', 'query'],
+    ['digest'],
     ['import', '--from-repo', TEAM_URL], ['import', '--from-repo-list', 'repos.yaml'],
     ['import', '--from-iwiki', 'page', '--from-mr', 'url'], ['import', '--from-claude'],
   ])('refuses unsafe preview %j before writing', (...args) => {

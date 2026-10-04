@@ -721,7 +721,7 @@ teamai pull --dry-run    # Dry run, no actual changes
 
 A command with no `--dry-run` preview, such as `teamai init`, `teamai hooks remove`, `teamai models add` / `configure` / `remove`, `teamai bind-project` or `teamai codebase --extract`, refuses the flag: it prints `teamai <command> has no --dry-run preview, nothing was run` and exits 1.
 
-Until #971 lands, `remove`, `roles init/add/remove/update`, `projects add/update/remove`, and `import --from-repo/--from-repo-list` also refuse `--dry-run`. Until #970 lands, `stats` and `recall <query>` refuse it. `digest`, `import --from-claude`, and `import --from-iwiki` have no safe preview and refuse it too. Previews for `import --from-org`, `--from-mr`, `--dir`, and `recall feedback` remain available. The later-merging PR must restore the guard classification for commands whose previews are fixed.
+Until #971 lands, `remove`, `roles init/add/remove/update`, `projects add/update/remove`, and `import --from-repo/--from-repo-list` also refuse `--dry-run`. `digest`, `import --from-claude`, and `import --from-iwiki` have no safe preview and refuse it too. Previews for `stats`, `recall <query>`, `import --from-org`, `--from-mr`, `--dir`, and `recall feedback` are available.
 
 A manual `teamai pull` ends by running the `teamai doctor` checks and printing each one that failed, with its fix — including whether the skills it just reported syncing are readable on disk for every enabled tool. It prints nothing when they all pass, and the exit code is unchanged. The SessionStart hook path and `--dry-run` run no checks at all, so session startup stays as fast as before. Provider checks (`gh`/`gf` authentication) are left to `teamai doctor`: the pull just used the provider.
 
