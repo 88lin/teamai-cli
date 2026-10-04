@@ -655,4 +655,35 @@ describe('recallFeedback', () => {
     expect(after.votes['doc-zero'].upvoted_count).toBe(0);
     expect(after.votes['doc-zero'].last_upvoted_at).toBeUndefined();
   });
+
+  // The votes lock covers the local file, not the team one, so the migrating
+  // loader rewrote a team file whose lock this path does not hold (#972).
+  it('negative reads the team votes file without migrating it', async () => {
+    const votesDir = path.join(tmpDir, '.teamai', 'user-votes');
+    fs.mkdirSync(votesDir, { recursive: true });
+    const votePath = path.join(votesDir, 'testuser.yaml');
+    await incrementRecalled(votePath, ['doc-team']);
+    await incrementUpvoted(votePath, ['doc-team']);
+
+    const teamVotesDir = path.join(tmpDir, 'reports-wt', 'votes');
+    fs.mkdirSync(teamVotesDir, { recursive: true });
+    const teamVotePath = path.join(teamVotesDir, 'testuser.yaml');
+    const teamV1: UserVotes = { votes: { 'doc-team': { at: '2026-06-01T00:00:00Z' } } };
+    fs.writeFileSync(teamVotePath, YAML.stringify(teamV1));
+    const teamBefore = fs.readFileSync(teamVotePath, 'utf-8');
+
+    vi.doMock('../utils/reports-branch.js', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../utils/reports-branch.js')>()),
+      indexableVotesDir: () => Promise.resolve(teamVotesDir),
+    }));
+
+    await recallFeedback({ negative: 'doc-team' });
+
+    expect(fs.readFileSync(teamVotePath, 'utf-8')).toBe(teamBefore);
+    // The local file is the one the lock covers, and it is still written.
+    const local = YAML.parse(fs.readFileSync(votePath, 'utf-8')) as UserVotesV2;
+    expect(local.votes['doc-team'].upvoted_count).toBe(0);
+
+    vi.doUnmock('../utils/reports-branch.js');
+  });
 });

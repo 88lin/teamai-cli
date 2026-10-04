@@ -146,3 +146,23 @@ describe('feedback preview storage and validation', () => {
     expect(snapshot()).toEqual(before);
   });
 });
+
+// A real `--negative` reads the team's votes file to count upvotes the team
+// already holds. The votes lock covers the local file, not that one, so the
+// migrating loader rewrote a team file whose lock this path does not hold (#972).
+describe('real negative feedback and the team votes file', () => {
+  it('counts the team upvotes without rewriting a v1 team file', () => {
+    const { votes } = setupScope('user');
+    const teamVotes = path.join(home, '.teamai', 'reports-wt', 'votes', 'tester.yaml');
+    writeYaml(teamVotes, { votes: { doc123: { at: '2026-10-01T00:00:00Z' } } });
+    const teamBefore = fs.readFileSync(teamVotes, 'utf8');
+
+    const result = run(['recall', 'feedback', '--negative', 'doc123']);
+
+    expect(result.code, result.output).toBe(0);
+    expect(fs.readFileSync(teamVotes, 'utf8')).toBe(teamBefore);
+    // The local file is the one the lock covers, and it is still written.
+    const local = YAML.parse(fs.readFileSync(votes, 'utf8')) as UserVotesV2;
+    expect(local.votes.doc123.upvoted_count).toBe(1);
+  });
+});

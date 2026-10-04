@@ -507,9 +507,11 @@ export async function recallFeedback(opts: { positive?: string; negative?: strin
       const data = await loadUserVotes(votePath);
       // The scope's own file starts empty on upgrade (#787), so the upvotes its
       // team already holds count too: that file plus the deltas not yet pushed.
+      // Read-only, and the lock above covers votePath, not this file, so the
+      // migrating loader would rewrite a team file it does not hold (#972).
       const team: UserVotesV2 = teamVotesDir === undefined
         ? { version: 2, votes: {}, deltas: {} }
-        : await loadUserVotes(path.join(teamVotesDir, `${localConfig.username}.yaml`));
+        : await readUserVotes(path.join(teamVotesDir, `${localConfig.username}.yaml`));
       const teamEntry = team.votes[opts.negative!];
       const known = data.votes[opts.negative!] ?? teamEntry;
       if (!known) return 'missing' as const;
