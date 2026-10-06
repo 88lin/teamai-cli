@@ -383,7 +383,7 @@ teamai projects remove checkout
 `--namespaces` sets the same namespaces on every project resource type
 (`knowledge`, `skills`, `learnings`, `agents`); `update` adds or removes them on
 each type's own list, so a hand-edited per-type layout survives. Neither touches
-`env`, `hooks`, `mcp`, `models` or `docs`: declare those by hand (see
+`env`, `hooks`, `mcp`, `models`, `docs` or `wiki`: declare those by hand (see
 [Env, hooks and MCP servers by namespace](#env-hooks-and-mcp-servers-by-namespace)),
 because a member on an older CLI cannot read them. After
 `projects remove`, a directory that still has the project active warns on its
@@ -1960,6 +1960,18 @@ Changes queued in `.teamai/pending-review.jsonl` can be inspected with `teamai r
 When extract finds components, it writes `teamwiki/evidence/code/<project>/_manifest.json` even if AI enrichment is skipped or produces nothing, so `--deep-enrich` can start.
 
 Without `--project`, `<project>` is the directory's name. At the root of a checkout, the main one or a linked git worktree, it is the repo's name: the main checkout's real name (also when opened through a symlink), or a bare repo's (`repo/.bare` or `repo.git` → `repo`). Every checkout of a repo writes the same entry. `teamai import --dir` picks its slug the same way.
+
+**Wiki by namespace.** `recall` scopes `teamwiki/evidence/code/<slug>/` the same way it scopes docs: once any role (in `manifest/roles.yaml`) or project (in `manifest/projects.yaml`) lists a codebase slug under `resources.wiki`, it reaches only the members who have it active, and an undeclared slug stays shared:
+
+```yaml
+# manifest/projects.yaml
+projects:
+  - id: svc-a
+    resources:
+      wiki: [svc-a]     # evidence/code/svc-a/ only where svc-a is active
+```
+
+The slug is whichever one `teamai codebase --project <slug>` (or `teamai import`) wrote under `evidence/code/`; it has no required relationship to the manifest's project id, so declare the one the extraction actually used. Legacy mode (no role and no `projects.yaml`) searches every codebase, as before.
 
 ### Dashboard
 

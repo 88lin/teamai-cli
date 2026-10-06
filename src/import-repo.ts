@@ -51,11 +51,17 @@ interface SimpleGraphNode {
     kind?: string; type?: string;
     label?: string; title?: string;
     file?: string;
+    origin?: string;
 }
 
 interface SimpleGraphIndex {
     nodes: SimpleGraphNode[];
-    edges: Array<{ from: string; to: string; relation: string }>;
+    edges: Array<{ from: string; to: string; relation: string; origin?: string }>;
+}
+
+interface LabelMatch {
+    id: string;
+    origin?: string;
 }
 
 /**
@@ -70,26 +76,43 @@ interface SimpleGraphIndex {
 export function detectCrossRepoEdges(
     overlay: SimpleGraphIndex,
     existing: SimpleGraphIndex,
-): Array<{ from: string; to: string; relation: 'DEPENDS_ON' }> {
-    const crossEdges: Array<{ from: string; to: string; relation: 'DEPENDS_ON' }> = [];
+): Array<{ from: string; to: string; relation: 'DEPENDS_ON'; crossOriginPairs?: string[][] }> {
+    const crossEdges: Array<{ from: string; to: string; relation: 'DEPENDS_ON'; crossOriginPairs?: string[][] }> = [];
     const edgeSet = new Set<string>();
 
     const nodeId = (n: SimpleGraphNode): string => n.id ?? n.slug ?? '';
     const nodeLabel = (n: SimpleGraphNode): string => n.label ?? n.title ?? '';
     const nodeKind = (n: SimpleGraphNode): string => n.kind ?? n.type ?? '';
+    // Both sides this edge spans matter: the side whose own import produced
+    // the match, AND the side that match resolved to. Either one being
+    // withheld later makes the relationship stale, so both are captured now
+    // as a single pair — a slug collision after this can still reattribute
+    // either endpoint node's CURRENT origin, but never this edge's own
+    // record of what it depended on at the moment it was detected. Wrapped
+    // in an outer array since `mergeGraphs` unions pairs from independent
+    // detections rather than letting one overwrite another (#974 review
+    // round 15 P2) — see `GraphEdge.crossOriginPairs`.
+    const crossOriginPair = (a?: string, b?: string): string[][] | undefined => {
+        const origins = [a, b].filter((o): o is string => !!o);
+        return origins.length > 0 ? [origins] : undefined;
+    };
 
-    // Build label index for the existing graph's components/interfaces
-    const existingIndex = new Map<string, string>();
+    // Build label index for the existing graph's components/interfaces. Each
+    // entry's `origin` is the matched node's AT THIS MOMENT — the only time
+    // it's unambiguous, since a later-aggregated repo can still mint a
+    // colliding unqualified slug and win the merge, silently reattributing
+    // the final node without updating an edge created from this match.
+    const existingIndex = new Map<string, LabelMatch>();
     for (const node of existing.nodes) {
         const label = nodeLabel(node);
-        if (label) existingIndex.set(label.toLowerCase(), nodeId(node));
+        if (label) existingIndex.set(label.toLowerCase(), { id: nodeId(node), origin: node.origin });
     }
 
     // Build label index for the new graph's components/interfaces
-    const overlayIndex = new Map<string, string>();
+    const overlayIndex = new Map<string, LabelMatch>();
     for (const node of overlay.nodes) {
         const label = nodeLabel(node);
-        if (label) overlayIndex.set(label.toLowerCase(), nodeId(node));
+        if (label) overlayIndex.set(label.toLowerCase(), { id: nodeId(node), origin: node.origin });
     }
 
     // Check if import edge targets in the new repo match component names in the existing repo
@@ -104,10 +127,16 @@ export function detectCrossRepoEdges(
             const fromNode = overlay.nodes.find(n => (n.file ?? n.id ?? n.slug ?? '') === edge.from);
             if (fromNode) {
                 const fromId = nodeId(fromNode);
-                const key = `${fromId}|${match}`;
+                const key = `${fromId}|${match.id}`;
                 if (!edgeSet.has(key)) {
                     edgeSet.add(key);
-                    crossEdges.push({ from: fromId, to: match, relation: 'DEPENDS_ON' });
+                    // The import edge's OWN origin tag, not a fresh lookup of
+                    // whichever node currently sits at `edge.from`'s slug: a
+                    // node collision that happens AFTER this edge was tagged
+                    // (in a later-processed repo) can silently swap that
+                    // node out without ever touching this edge's own tag
+                    // (#974 review round 14 P1).
+                    crossEdges.push({ from: fromId, to: match.id, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(edge.origin ?? fromNode.origin, match.origin) });
                 }
             }
         }
@@ -125,10 +154,17 @@ export function detectCrossRepoEdges(
             const fromNode = existing.nodes.find(n => (n.file ?? n.id ?? n.slug ?? '') === edge.from);
             if (fromNode) {
                 const fromId = nodeId(fromNode);
-                const key = `${fromId}|${match}`;
+                const key = `${fromId}|${match.id}`;
                 if (!edgeSet.has(key)) {
                     edgeSet.add(key);
-                    crossEdges.push({ from: fromId, to: match, relation: 'DEPENDS_ON' });
+                    // Same reasoning as the forward loop above: `existing`
+                    // accumulates every repo processed so far, so the node
+                    // currently at `edge.from`'s slug may already belong to
+                    // a DIFFERENT, later-colliding repo than the one whose
+                    // `imports` edge this actually is. `edge.origin` was
+                    // stamped once, at that edge's own tagging time, and is
+                    // immune to any node collision that happens afterward.
+                    crossEdges.push({ from: fromId, to: match.id, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(edge.origin ?? fromNode.origin, match.origin) });
                 }
             }
         }
@@ -144,10 +180,10 @@ export function detectCrossRepoEdges(
         const cfgId = nodeId(cfg);
         const match = existingIndex.get(cfgName);
         if (match) {
-            const key = `${match}|${cfgId}`;
+            const key = `${match.id}|${cfgId}`;
             if (!edgeSet.has(key)) {
                 edgeSet.add(key);
-                crossEdges.push({ from: match, to: cfgId, relation: 'DEPENDS_ON' });
+                crossEdges.push({ from: match.id, to: cfgId, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(match.origin, cfg.origin) });
             }
         }
     }
@@ -158,10 +194,10 @@ export function detectCrossRepoEdges(
         const cfgId = nodeId(cfg);
         const match = overlayIndex.get(cfgName);
         if (match) {
-            const key = `${match}|${cfgId}`;
+            const key = `${match.id}|${cfgId}`;
             if (!edgeSet.has(key)) {
                 edgeSet.add(key);
-                crossEdges.push({ from: match, to: cfgId, relation: 'DEPENDS_ON' });
+                crossEdges.push({ from: match.id, to: cfgId, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(match.origin, cfg.origin) });
             }
         }
     }
