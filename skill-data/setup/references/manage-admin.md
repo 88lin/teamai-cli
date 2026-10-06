@@ -134,11 +134,21 @@ teamai projects remove <id>  # remove a project
 
 A member gets the union of their role resources and their active project's
 resources. Admins declare projects in `manifest/projects.yaml` with the commands
-above, each of which opens a PR. Until #971 lands and restores the guard
-classification, `roles init/add/update/remove` and `projects add/update/remove`
-refuse `--dry-run` before pulling the team repo. After `projects remove`,
+above, each of which opens a PR. `roles init/add/update/remove` and
+`projects add/update/remove` support `--dry-run` without pulling the team repo.
+Clone previews use the contents after a real pull on the checked-out branch: an
+ahead branch stays ahead, a behind branch advances, and a diverged branch uses
+origin/current-branch. `roles init` preview checks that manifest before asking
+for overwrite confirmation. After `projects remove`,
 keep the project's content in the team repo until members have pulled: that is
 what lets their next pull clean up the copies they deployed.
+
+`roles init/add/update/remove` and `projects add/update/remove` previews, and resource removal
+previews, refuse a team clone with uncommitted changes. Commit or stash them before retrying. Single-repo
+previews still work with dirty business files because they read origin. Clone
+previews refresh the configured upstream first, even when its branch or remote
+name differs. A failed fast-forward or missing upstream uses origin/current-branch
+for the real reset fallback. Removal refuses when that refresh also fails.
 
 Every namespace that names a directory — `knowledge`, `skills`, `agents`, `env`,
 `hooks`, `mcp`, `models` and `docs` in either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
